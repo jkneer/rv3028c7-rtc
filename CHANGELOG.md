@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0] - Unreleased
 
 ### Changed
+- **Breaking:** driver methods and backend traits now return `Error<I2C::Error>`:
+  `I2c` preserves bus failures, `InvalidData` reports invalid input/register values,
+  and `InconsistentRead` reports a counter that did not stabilize within four reads.
+- Date/time and alarm setters validate inputs before bus access. Calendar setters
+  require years 2000–2099. Invalid disabled alarm register fields are normalized
+  to zero (or day 1 for date alarms) when read; invalid enabled fields return an error.
 - **Breaking:** ported to `embedded-hal` 1.0. `RV3028<I2C>` now requires
   `I2C: embedded_hal::i2c::I2c` instead of the `embedded-hal` 0.2
   `Write + Read + WriteRead` traits. HALs that only implement `embedded-hal` 0.2
@@ -16,8 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a different trait from the one in `rtcc` 0.3. Import it via `rv3028c7_rtc::DateTimeAccess`
   or depend on `rtcc` 0.4.
 - **Breaking:** moved to Rust edition 2024; the minimum supported Rust version is now 1.85.
-- Removed the redundant error type parameter from the driver's `impl` blocks. Errors are
-  `I2C::Error`, which is the same type as before.
+- Removed the redundant error type parameter from the driver's `impl` blocks. Bus errors are
+  preserved inside `Error::I2c`.
 - Require `chrono` 0.4.45 and replace deprecated `chrono` APIs.
 - Examples share the I2C bus with `embedded-hal-bus` instead of `shared-bus`, and use
   `linux-embedded-hal` 0.5, `ds323x` 0.7, `gpiocdev` 0.8 and `spin_sleep` 1.3.

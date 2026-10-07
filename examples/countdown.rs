@@ -11,7 +11,7 @@ fn delta_micros(actual: Duration, expected: Duration) -> i128 {
   actual.as_micros() as i128 - expected.as_micros() as i128
 }
 
-fn test_one_shot_duration<I2C>(rtc: &mut RV3028<I2C>, duration: &Duration) -> Result<Duration, I2C::Error>
+fn test_one_shot_duration<I2C>(rtc: &mut RV3028<I2C>, duration: &Duration) -> Result<Duration, rv3028c7_rtc::Error<I2C::Error>>
   where
     I2C: I2c,
     I2C::Error: std::fmt::Debug,
@@ -61,7 +61,7 @@ fn test_one_shot_duration<I2C>(rtc: &mut RV3028<I2C>, duration: &Duration) -> Re
   Ok(actual)
 }
 
-fn test_periodic_duration<I2C>(rtc: &mut RV3028<I2C>, duration: &Duration) -> Result<(), I2C::Error>
+fn test_periodic_duration<I2C>(rtc: &mut RV3028<I2C>, duration: &Duration) -> Result<(), rv3028c7_rtc::Error<I2C::Error>>
   where
     I2C: I2c,
     I2C::Error: std::fmt::Debug,

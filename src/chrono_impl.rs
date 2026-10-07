@@ -4,32 +4,45 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Weekday};
 use embedded_hal::i2c::I2c;
 use rtcc::DateTimeAccess;
 
-use crate::{AlarmParts, DateTimeParts, RV3028};
+use crate::{AlarmParts, DateTimeParts, Error, RV3028};
 
 impl<I2C> DateTimeAccess for  RV3028<I2C>
   where
     I2C: I2c,
 {
-  type Error = I2C::Error;
+  type Error = Error<I2C::Error>;
 
   /// This particular RTC's timestamps wrap at 0xFFFF_FFFF, around the year 2106.
   /// It doesn't support:
   /// - years prior to 1970
   /// - leap year calculations past 2099
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InconsistentRead`] if no consecutive counter reads agree
+  /// within four reads total. Individual transaction timeouts remain the
+  /// HAL's responsibility.
   fn datetime(&mut self) -> Result<NaiveDateTime, Self::Error> {
     let unix_timestamp = self.get_unix_time_blocking()?;
-    Ok(DateTime::from_timestamp(unix_timestamp.into(), 0).unwrap().naive_utc())
+    Ok(DateTime::from_timestamp(unix_timestamp.into(), 0).ok_or(Error::InvalidData)?.naive_utc())
   }
 
-  /// This implementation assumes (but doesn't verify)
-  /// that the caller is setting the RTC datetime to values within its range (from 2000 to 2099).
+  /// Dates outside 2000 to 2099 return [`Error::InvalidData`] before any bus access.
   /// The RTC doesn't support leap year corrections beyond 2099,
   /// and the internal Year BCD register only runs from 0..99 (for 2000..2099).
   /// This method resets the internal prescaler pipeline, which means that
   /// subsecond counters are zeroed, when it writes to the Seconds register.
   /// This assists with clock synchronization with external clocks.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InvalidData`] if the year is outside 2000–2099.
+  /// Validation happens before any bus access. Subseconds are ignored.
   fn set_datetime(&mut self, datetime: &NaiveDateTime) -> Result<(), Self::Error> {
-    let unix_timestamp: u32 = datetime.and_utc().timestamp().try_into().unwrap();
     let raw = DateTimeParts {
       year: datetime.year(),
       month: datetime.month() as u8,
@@ -38,7 +51,7 @@ impl<I2C> DateTimeAccess for  RV3028<I2C>
       minute: datetime.minute() as u8,
       second: datetime.second() as u8,
     };
-    self.set_datetime_raw(unix_timestamp, &raw, datetime.weekday() as u8)
+    self.set_datetime_parts(&raw)
   }
 
 }
@@ -57,16 +70,36 @@ pub trait ChronoAccess {
   /// - `match_day` indicates whether the day (or weekday) should be matched for the alarm
   /// - `match_hour` indicates whether the hour should be matched for the alarm
   /// - `match_minute` indicates whether the minutes should be matched for the alarm
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
   fn set_alarm(&mut self, datetime: &NaiveDateTime, weekday: Option<Weekday>,
                match_day: bool, match_hour: bool, match_minute: bool) -> Result<(), Self::Error>;
 
   /// Read the alarm settings
   /// Matches are flag settings for whether the alarm should match day, hour, minute
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InvalidData`] if an enabled alarm field contains invalid
+  /// BCD or an out-of-range value. Invalid disabled fields are replaced
+  /// with zero (or day 1 for a date alarm).
   fn get_alarm_datetime_wday_matches(&mut self)
     -> Result<(NaiveDateTime, Option<Weekday>, bool, bool, bool), Self::Error>;
 
   /// Get event count -- the number of events that have been logged since enabling logging
   /// Returns the count of events since last reset, and the datetime of one event
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InvalidData`] if a nonzero event count accompanies invalid
+  /// BCD or an invalid calendar date/time. Timestamp fields are ignored
+  /// when the event count is zero.
   fn get_event_count_and_datetime(&mut self) -> Result<(u32, Option<NaiveDateTime>), Self::Error>;
 }
 
@@ -74,7 +107,7 @@ impl<I2C> ChronoAccess for RV3028<I2C>
   where
     I2C: I2c,
 {
-  type Error = I2C::Error;
+  type Error = Error<I2C::Error>;
 
   fn set_alarm(&mut self, datetime: &NaiveDateTime, weekday: Option<Weekday>,
                match_day: bool, match_hour: bool, match_minute: bool) -> Result<(), Self::Error> {
@@ -100,14 +133,14 @@ impl<I2C> ChronoAccess for RV3028<I2C>
 
     let dt =
       if alarm.weekday_alarm {
-        weekday = Some(Weekday::try_from(alarm.day).unwrap());
-        DateTime::UNIX_EPOCH.naive_utc().with_hour(alarm.hour as u32).unwrap()
-          .with_minute(alarm.minute as u32).unwrap()
+        weekday = Some(Weekday::try_from(alarm.day).map_err(|_| Error::InvalidData)?);
+        DateTime::UNIX_EPOCH.naive_utc().with_hour(alarm.hour as u32).ok_or(Error::InvalidData)?
+          .with_minute(alarm.minute as u32).ok_or(Error::InvalidData)?
       }
       else {
-        DateTime::UNIX_EPOCH.naive_utc().with_day(alarm.day as u32).unwrap()
-          .with_hour(alarm.hour as u32).unwrap()
-          .with_minute(alarm.minute as u32).unwrap()
+        DateTime::UNIX_EPOCH.naive_utc().with_day(alarm.day as u32).ok_or(Error::InvalidData)?
+          .with_hour(alarm.hour as u32).ok_or(Error::InvalidData)?
+          .with_minute(alarm.minute as u32).ok_or(Error::InvalidData)?
       };
 
     Ok((dt, weekday, alarm.match_day, alarm.match_hour, alarm.match_minute))
@@ -117,9 +150,9 @@ impl<I2C> ChronoAccess for RV3028<I2C>
     let (count, raw) = self.get_event_count_and_parts()?;
     let odt = raw.map(|dt|
       NaiveDate::from_ymd_opt(dt.year, dt.month as u32, dt.day as u32)
-        .expect("YMD")
+        .ok_or(Error::InvalidData)?
         .and_hms_opt(dt.hour as u32, dt.minute as u32, dt.second as u32)
-        .expect("HMS"));
+        .ok_or(Error::InvalidData)).transpose()?;
     Ok((count, odt))
   }
 }
@@ -149,7 +182,6 @@ mod tests {
     let expectations = [
       // the counter ticks between the first two reads, so they are read again
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], before.to_vec()),
-      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
     ];
@@ -268,4 +300,14 @@ mod tests {
     assert_eq!(rv3028.get_event_count_and_datetime().unwrap(), (0, None));
     rv3028.i2c.done();
   }
+  #[test]
+  fn unsupported_years_return_errors_without_bus_access() {
+    let mut rtc = RV3028::new(I2cMock::new(&[]));
+    for year in [1969, 1999, 2100, 2200] {
+      let dt = NaiveDate::from_ymd_opt(year, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+      assert_eq!(DateTimeAccess::set_datetime(&mut rtc, &dt), Err(Error::InvalidData));
+    }
+    rtc.i2c.done();
+  }
+
 }

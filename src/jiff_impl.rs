@@ -5,7 +5,7 @@ use jiff::civil::{self, Weekday};
 use jiff::tz::Offset;
 use jiff::Timestamp;
 
-use crate::{AlarmParts, DateTimeParts, RV3028};
+use crate::{AlarmParts, DateTimeParts, Error, RV3028};
 
 /// Date and time, alarm and event timestamp access using [`jiff`] types.
 ///
@@ -21,18 +21,32 @@ pub trait JiffDateTimeAccess {
   /// It doesn't support:
   /// - years prior to 1970
   /// - leap year calculations past 2099
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InconsistentRead`] if no consecutive counter reads agree
+  /// within four reads total. Individual transaction timeouts remain the
+  /// HAL's responsibility.
   fn datetime(&mut self) -> Result<civil::DateTime, Self::Error>;
 
   /// Set the date and time: both the unix time counter and all internal BCD registers.
   ///
-  /// This implementation assumes (but doesn't verify)
-  /// that the caller is setting the RTC datetime to values within its range (from 2000 to 2099).
+  /// Dates outside 2000 to 2099 return [`Error::InvalidData`] before any bus access.
   /// The RTC doesn't support leap year corrections beyond 2099,
   /// and the internal Year BCD register only runs from 0..99 (for 2000..2099).
   /// Subsecond values are ignored.
   /// This method resets the internal prescaler pipeline, which means that
   /// subsecond counters are zeroed, when it writes to the Seconds register.
   /// This assists with clock synchronization with external clocks.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InvalidData`] if the year is outside 2000–2099.
+  /// Validation happens before any bus access. Subseconds are ignored.
   fn set_datetime(&mut self, datetime: &civil::DateTime) -> Result<(), Self::Error>;
 
   /// All-in-one method to set an alarm:
@@ -42,6 +56,10 @@ pub trait JiffDateTimeAccess {
   /// - `match_day` indicates whether the day (or weekday) should be matched for the alarm
   /// - `match_hour` indicates whether the hour should be matched for the alarm
   /// - `match_minute` indicates whether the minutes should be matched for the alarm
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
   fn set_alarm(&mut self, datetime: &civil::DateTime, weekday: Option<Weekday>,
                match_day: bool, match_hour: bool, match_minute: bool) -> Result<(), Self::Error>;
 
@@ -49,11 +67,27 @@ pub trait JiffDateTimeAccess {
   /// Matches are flag settings for whether the alarm should match day, hour, minute.
   /// The date part of the returned datetime is 1970-01-01 for a weekday alarm,
   /// or 1970-01-`day` for a date alarm.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InvalidData`] if an enabled alarm field contains invalid
+  /// BCD or an out-of-range value. Invalid disabled fields are replaced
+  /// with zero (or day 1 for a date alarm).
   fn get_alarm_datetime_wday_matches(&mut self)
     -> Result<(civil::DateTime, Option<Weekday>, bool, bool, bool), Self::Error>;
 
   /// Get event count -- the number of events that have been logged since enabling logging
   /// Returns the count of events since last reset, and the datetime of one event
+  ///
+  /// # Errors
+  ///
+  /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
+  ///
+  /// [`Error::InvalidData`] if a nonzero event count accompanies invalid
+  /// BCD or an invalid calendar date/time. Timestamp fields are ignored
+  /// when the event count is zero.
   fn get_event_count_and_datetime(&mut self) -> Result<(u32, Option<civil::DateTime>), Self::Error>;
 }
 
@@ -61,12 +95,12 @@ impl<I2C> JiffDateTimeAccess for RV3028<I2C>
   where
     I2C: I2c,
 {
-  type Error = I2C::Error;
+  type Error = Error<I2C::Error>;
 
   fn datetime(&mut self) -> Result<civil::DateTime, Self::Error> {
     let unix_timestamp = self.get_unix_time_blocking()?;
     // every u32 timestamp is within jiff's supported range
-    let timestamp = Timestamp::from_second(unix_timestamp.into()).unwrap();
+    let timestamp = Timestamp::from_second(unix_timestamp.into()).map_err(|_| Error::InvalidData)?;
     Ok(Offset::UTC.to_datetime(timestamp))
   }
 
@@ -105,14 +139,14 @@ impl<I2C> JiffDateTimeAccess for RV3028<I2C>
 
     let day =
       if alarm.weekday_alarm {
-        weekday = Some(Weekday::from_monday_zero_offset(alarm.day as i8).unwrap());
+        weekday = Some(Weekday::from_monday_zero_offset(alarm.day as i8).map_err(|_| Error::InvalidData)?);
         1
       }
       else {
         alarm.day as i8
       };
     let dt = civil::DateTime::new(1970, 1, day, alarm.hour as i8, alarm.minute as i8, 0, 0)
-      .unwrap();
+      .map_err(|_| Error::InvalidData)?;
 
     Ok((dt, weekday, alarm.match_day, alarm.match_hour, alarm.match_minute))
   }
@@ -122,7 +156,7 @@ impl<I2C> JiffDateTimeAccess for RV3028<I2C>
     let odt = parts.map(|dt|
       civil::DateTime::new(dt.year as i16, dt.month as i8, dt.day as i8,
                            dt.hour as i8, dt.minute as i8, dt.second as i8, 0)
-        .expect("event timestamp"));
+        .map_err(|_| Error::InvalidData)).transpose()?;
     Ok((count, odt))
   }
 }
@@ -152,7 +186,6 @@ mod tests {
     let expectations = [
       // the counter ticks between the first two reads, so they are read again
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], before.to_vec()),
-      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
     ];
@@ -272,4 +305,14 @@ mod tests {
     assert_eq!(rv3028.get_event_count_and_datetime().unwrap(), (0, None));
     rv3028.i2c.done();
   }
+  #[test]
+  fn unsupported_years_return_errors_without_bus_access() {
+    let mut rtc = RV3028::new(I2cMock::new(&[]));
+    for year in [1969, 1999, 2100, 2200] {
+      let dt = civil::date(year, 1, 1).at(0, 0, 0, 0);
+      assert_eq!(JiffDateTimeAccess::set_datetime(&mut rtc, &dt), Err(Error::InvalidData));
+    }
+    rtc.i2c.done();
+  }
+
 }

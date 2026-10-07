@@ -82,8 +82,24 @@ let mut rtc1 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b0000_0
 let mut rtc2 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b1000_0000);
 ```
 
+### Errors
+
+All fallible driver methods return `rv3028c7_rtc::Error<I2C::Error>`:
+
+- `Error::I2c(error)` preserves the underlying HAL error.
+- `Error::InvalidData` reports an invalid input or register value.
+- `Error::InconsistentRead` means no consecutive Unix counter reads agreed within
+  four reads. The HAL remains responsible for individual transaction timeouts.
+
+Date/time setters require valid dates in 2000–2099 and validate before any bus
+access. Alarm setters validate all fields, even disabled ones. Alarm reads preserve
+valid disabled values, replacing invalid disabled values with zero (or day 1 for
+date alarms). Invalid enabled fields return an error. Subseconds are ignored.
+
 ### Upgrading from 0.5
 
+- Explicit result types must use `Error<I2C::Error>` instead of `I2C::Error`;
+  match `Error::I2c(inner)` to inspect bus failures.
 - Version 0.6 moves from `embedded-hal` 0.2 to 1.0, so your HAL must provide an
   `embedded-hal` 1.0 I2C implementation. If you used `shared-bus`, switch to `embedded-hal-bus`
   as shown above.
