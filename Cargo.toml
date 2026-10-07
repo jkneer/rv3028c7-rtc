@@ -11,15 +11,22 @@ readme = "README.md"
 keywords = ["no-std", "driver", "embedded-hal", "i2c", "rtc"]
 categories = ["embedded", "hardware-support", "no-std"]
 
+[package.metadata.docs.rs]
+# document both date/time backends
+all-features = true
+
 [features]
 default = ["chrono"]
 # chrono date/time types, including the rtcc `DateTimeAccess` trait
 chrono = ["dep:chrono", "dep:rtcc"]
+# jiff date/time types, via the `JiffDateTimeAccess` trait
+jiff = ["dep:jiff"]
 
 [dependencies]
 embedded-hal = "1.0.0"
 rtcc = { version = "0.4.0", optional = true }
 chrono = { version = "0.4.45", default-features = false, optional = true }
+jiff = { version = "0.2.38", default-features = false, optional = true }
 
 [dev-dependencies]
 embedded-hal-mock = { version = "0.11.1", default-features = false, features = ["eh1"] }
@@ -75,3 +82,7 @@ required-features = ["chrono"]
 [[example]]
 name = "trickle_mux"
 required-features = ["chrono"]
+
+[[example]]
+name = "jiff_alarm"
+required-features = ["jiff"]

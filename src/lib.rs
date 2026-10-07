@@ -1,3 +1,48 @@
+//! `no_std` driver for the Micro Crystal RV-3028-C7 real time clock (RTC),
+//! for any I2C bus implementing the [`embedded_hal`] 1.0 [`I2c`] trait.
+//!
+//! The driver is [`RV3028`]. Dates and times can be handled with one of two optional
+//! date/time libraries, or without any:
+//!
+//! | Feature | Default | Provides |
+//! |---|---|---|
+//! | `chrono` | yes | `DateTimeAccess` (from `rtcc`) and `ChronoAccess`, using `chrono::NaiveDateTime` |
+//! | `jiff` | no | `JiffDateTimeAccess`, using `jiff::civil::DateTime` |
+//! | (none) | | [`DateTimeParts`] and [`AlarmParts`], with [`RV3028::set_datetime_parts`] and friends |
+//!
+//! Both features can be enabled at the same time. Everything that doesn't involve a date or time,
+//! such as the countdown timer, interrupts, trickle charging and the unix time counter,
+//! is always available.
+//!
+//! # Example
+//!
+//! ```
+//! use embedded_hal::i2c::I2c;
+//! use rv3028c7_rtc::{DateTimeParts, RV3028};
+//!
+//! fn set_clock<I2C: I2c>(i2c: I2C) -> Result<u32, I2C::Error> {
+//!     let mut rtc = RV3028::new(i2c);
+//!     rtc.set_datetime_parts(&DateTimeParts {
+//!         year: 2024, month: 3, day: 15, hour: 13, minute: 45, second: 30,
+//!     })?;
+//!     rtc.get_unix_time()
+//! }
+//! ```
+//!
+//! With the `chrono` feature, the same through `DateTimeAccess`:
+//!
+//! ```
+//! # #[cfg(feature = "chrono")] {
+//! use embedded_hal::i2c::I2c;
+//! use rv3028c7_rtc::{DateTimeAccess, NaiveDateTime, RV3028};
+//!
+//! fn read_clock<I2C: I2c>(i2c: I2C) -> Result<NaiveDateTime, I2C::Error> {
+//!     let mut rtc = RV3028::new(i2c);
+//!     rtc.datetime()
+//! }
+//! # }
+//! ```
+
 #![cfg_attr(not(test), no_std)]
 
 
@@ -9,6 +54,12 @@ pub use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekda
 pub use rtcc::{  DateTimeAccess };
 #[cfg(feature = "chrono")]
 pub use chrono_impl::ChronoAccess;
+#[cfg(feature = "jiff")]
+mod jiff_impl;
+#[cfg(feature = "jiff")]
+pub use jiff;
+#[cfg(feature = "jiff")]
+pub use jiff_impl::JiffDateTimeAccess;
 
 use core::time::Duration;
 use embedded_hal::i2c::I2c;
@@ -188,8 +239,10 @@ enum RegEventControlBits {
   TimeStampSourceBit = 1 << 0,
 }
 
-pub const TS_EVENT_SOURCE_EVI: u8 = 0; /// Event log source is external interrupt EVI (default)
-pub const TS_EVENT_SOURCE_BSF: u8 = 1; /// Event log source is backup power switchover
+/// Event log source is external interrupt EVI (default)
+pub const TS_EVENT_SOURCE_EVI: u8 = 0;
+/// Event log source is backup power switchover
+pub const TS_EVENT_SOURCE_BSF: u8 = 1;
 
 // REG_CLOCK_INTERRUPT_MASK bits
 #[repr(u8)]
@@ -236,11 +289,17 @@ enum RegEepromMirrorBits {
   TrickleChargeResistanceBits = 0b11, // TCR bits
 }
 
+/// Current limiting resistor for trickle charging the backup supply,
+/// see [`RV3028::toggle_trickle_charge`]. A higher resistance means less charging current.
 #[derive(Clone, Copy)]
 pub enum TrickleChargeCurrentLimiter {
+  /// 3 kΩ (factory default)
   Ohms3k = 0b00,
+  /// 5 kΩ
   Ohms5k = 0b01,
+  /// 9 kΩ
   Ohms9k = 0b10,
+  /// 15 kΩ
   Ohms15k = 0b11,
 }
 
@@ -1111,6 +1170,11 @@ impl<I2C> RV3028<I2C>
 }
 
 
+/// Time stamp logging of events: external events on the EVI pin,
+/// or switchovers to the backup power supply.
+///
+/// Reading the logged time stamp needs a date/time representation, so it is provided by
+/// [`RV3028::get_event_count_and_parts`] and by the date/time backend traits.
 pub trait EventTimeStampLogger {
   /// Error type
   type Error;

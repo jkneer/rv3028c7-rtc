@@ -17,7 +17,7 @@ impl<I2C> DateTimeAccess for  RV3028<I2C>
   /// - years prior to 1970
   /// - leap year calculations past 2099
   fn datetime(&mut self) -> Result<NaiveDateTime, Self::Error> {
-    let unix_timestamp = self.get_unix_time()?;
+    let unix_timestamp = self.get_unix_time_blocking()?;
     Ok(DateTime::from_timestamp(unix_timestamp.into(), 0).unwrap().naive_utc())
   }
 
@@ -127,7 +127,10 @@ impl<I2C> ChronoAccess for RV3028<I2C>
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::*;
+  use crate::{
+    REG_CONTROL1, REG_COUNT_EVENTS_TS, REG_HOURS_ALARM, REG_MINUTES_ALARM, REG_SECONDS, REG_STATUS,
+    REG_UNIX_TIME_0, REG_WEEKDAY, REG_WEEKDAY_DATE_ALARM, RV3028_ADDRESS,
+  };
   use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
   use std::vec;
 
@@ -137,6 +140,22 @@ mod tests {
   // 2024-03-15 is a Friday (weekday 4, counting from Monday = 0)
   fn test_datetime() -> NaiveDateTime {
     NaiveDate::from_ymd_opt(2024, 3, 15).unwrap().and_hms_opt(13, 45, 30).unwrap()
+  }
+
+  #[test]
+  fn test_datetime_from_unix_time() {
+    let before = 1_710_510_329u32.to_le_bytes();
+    let unix_bytes = 1_710_510_330u32.to_le_bytes();
+    let expectations = [
+      // the counter ticks between the first two reads, so they are read again
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], before.to_vec()),
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_UNIX_TIME_0], unix_bytes.to_vec()),
+    ];
+    let mut rv3028 = RV3028::new(I2cMock::new(&expectations));
+    assert_eq!(rv3028.datetime().unwrap(), test_datetime());
+    rv3028.i2c.done();
   }
 
   #[test]
