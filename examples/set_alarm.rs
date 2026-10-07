@@ -3,7 +3,7 @@ use core::cell::RefCell;
 use linux_embedded_hal::I2cdev;
 use embedded_hal_bus::i2c::RefCellDevice;
 use chrono::{NaiveDateTime, Utc};
-use rv3028c7_rtc::{RV3028};
+use rv3028c7_rtc::{ChronoAccess, RV3028};
 use std::time::Duration;
 use std::thread::sleep;
 

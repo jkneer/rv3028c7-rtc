@@ -1,7 +1,7 @@
 use std::ops::{Add};
 use linux_embedded_hal::I2cdev;
 use chrono::{Datelike, NaiveDateTime, Timelike, Utc, Weekday};
-use rv3028c7_rtc::{RV3028};
+use rv3028c7_rtc::{ChronoAccess, RV3028};
 use std::time::Duration;
 use rtcc::DateTimeAccess;
 

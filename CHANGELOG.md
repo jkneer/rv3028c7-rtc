@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0] - Unreleased
 
 ### Changed
+- **Breaking:** use `core::time::Duration` for the countdown timer instead of
+  `chrono::Duration`; `Duration` is no longer re-exported.
+- **Breaking:** move Chrono alarm and timestamp access into `ChronoAccess`.
+- Make `chrono` and `rtcc` optional behind the default `chrono` feature.
 - **Breaking:** ported to `embedded-hal` 1.0. `RV3028<I2C>` now requires
   `I2C: embedded_hal::i2c::I2c` instead of the `embedded-hal` 0.2
   `Write + Read + WriteRead` traits. HALs that only implement `embedded-hal` 0.2
@@ -23,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `linux-embedded-hal` 0.5, `ds323x` 0.7, `gpiocdev` 0.8 and `spin_sleep` 1.3.
 
 ### Added
+- Library-independent `DateTimeParts` and `AlarmParts` APIs for use without
+  a date/time backend.
 - `check_and_clear_backup_event()` to check and clear the Backup Switch Flag (BSF).
 
 ### Fixed

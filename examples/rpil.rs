@@ -1,7 +1,8 @@
 use linux_embedded_hal::I2cdev;
 use chrono::{Utc};
-use rv3028c7_rtc::{RV3028, Datelike, Duration, NaiveDateTime, Timelike};
+use rv3028c7_rtc::{RV3028, Datelike, NaiveDateTime, Timelike};
 use std::thread::sleep;
+use std::time::Duration;
 use rtcc::DateTimeAccess;
 
 /// Example testing real RTC communications,
@@ -55,7 +56,7 @@ fn main() {
     loop {
         let dt = rtc.datetime().unwrap();
         println!("sys {}\r\nrtc {}", Utc::now().naive_utc(), dt);
-        sleep(Duration::seconds(5).to_std().unwrap());
+        sleep(Duration::from_secs(5));
     }
 
 
