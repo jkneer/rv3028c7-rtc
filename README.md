@@ -103,9 +103,64 @@ Empty slices at offsets 0, 1 or 2 perform no I/O. Writes do not verify readback
 or roll back partial transfers; record validity and commit ordering belong
 to the application. Password-protected writes require the chip to be unlocked.
 
+### EEPROM
+
+Version 0.6.1 adds access to all 43 User EEPROM bytes (0x00–0x2A).
+Like User RAM, the API takes an offset and a borrowed slice; a caller-provided
+`embedded_hal::delay::DelayNs` implements the required waits.
+
+```rust
+let mut bytes = [0; 2];
+rtc.read_user_eeprom(0, &mut bytes, &mut delay)?;
+bytes[1] = 0xA5;
+rtc.write_user_eeprom(1, &bytes[1..], &mut delay)?;
+```
+
+Writes compare stored values, program only changed bytes, then verify the entire
+requested range. Empty slices at offsets 0 through 43 perform no I/O.
+Out-of-range requests are rejected before mux selection or any other bus access.
+Reads and writes proceed in ascending address order; they are not atomic.
+Record layout, validity markers and commit ordering belong to the application.
+
+`read_eeprom(address, delay)` and `write_eeprom(address, value, delay)` access
+one byte at an absolute EEPROM address in 0x00–0x2A or 0x30–0x37.
+Reserved addresses are rejected. Reading configuration this way reads persistent
+EEPROM rather than its active RAM mirror. Writing it does not activate the change.
+
+For configuration mirrors, the driver provides:
+
+- `write_configuration_eeprom(address, bytes, delay)`: disable auto-refresh,
+  edit the supplied RAM mirrors in 0x30–0x37, update all eight EEPROM configuration
+  bytes, then verify the supplied bytes in EEPROM. Unspecified configuration
+  bytes are persisted from their current mirrors, including password settings.
+- `update_configuration_eeprom(delay)`: store all current configuration mirrors;
+  this always programs and does not verify readback.
+- `refresh_configuration(delay)`: reload all active configuration mirrors from
+  EEPROM, replacing any unpersisted edits.
+
+The chip's command protocol uses 1 ms settling for read/refresh and 10 ms for
+write/update before polling EEbusy. Each idle wait allows at most 200 one-millisecond
+intervals; HAL transaction timeouts remain the HAL's responsibility. The original
+EERD state is restored on success and attempted on failure. Other Control 1 bits
+are preserved. EEPROM methods return `EepromError<I2C::Error>`:
+
+- `Operation(kind)`: driver/bus failure, busy timeout, or readback mismatch.
+- `Restore { operation, error }`: failure to restore EERD, retaining any original
+  operation failure too. EERD is then unknown.
+
+After a timeout or bus failure, a command may still be running and data may be
+partially written. There is no automatic retry or rollback. VDD must stay at least
+1.5 V throughout programming and the chip must be operating from VDD. Unlock
+password protection before protected accesses; changing password configuration
+may require unlocking again for verification. The driver cannot ensure supply
+voltage or unlock the chip automatically.
+
+See the [Application Manual](https://www.microcrystal.com/fileadmin/Media/Products/RTC/App.Manual/RV-3028-C7_App-Manual.pdf),
+sections 4.6.3–4.6.9, for the hardware protocol and operating conditions.
+
 ### Errors
 
-All fallible driver methods return `rv3028c7_rtc::Error<I2C::Error>`:
+Non-EEPROM fallible driver methods return `rv3028c7_rtc::Error<I2C::Error>`:
 
 - `Error::I2c(error)` preserves the underlying HAL error.
 - `Error::InvalidData` reports an invalid input/register value or an out-of-range memory access.

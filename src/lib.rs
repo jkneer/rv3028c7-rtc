@@ -61,6 +61,12 @@ pub use jiff;
 #[cfg(feature = "jiff")]
 pub use jiff_impl::JiffDateTimeAccess;
 
+mod eeprom;
+pub use eeprom::{
+  EepromError, EepromErrorKind, USER_EEPROM_LEN,
+  CONFIGURATION_EEPROM_START, CONFIGURATION_EEPROM_LEN,
+};
+
 use core::time::Duration;
 use embedded_hal::i2c::I2c;
 
@@ -645,44 +651,6 @@ impl<I2C> RV3028<I2C>
       REG_STATUS, RegStatusBits::BackupSwitchFlag as u8)?;
     Ok(flag_set)
   }
-
-  // TODO these methods have not been thoroughly tested, and are believed broken.
-  // fn is_eeprom_busy(&mut self) -> Result<bool, Error<I2C::Error>> {
-  //   let status = self.read_register(REG_STATUS)?;
-  //   Ok(status & EEBUSY_BIT != 0)
-  // }
-  //
-  // fn disable_auto_eeprom_refresh(&mut self) -> Result<(), Error<I2C::Error>> {
-  //   let mut control_1 = self.read_register(REG_CONTROL1)?;
-  //   control_1 |= EERD_BIT; // Set EERD bit
-  //   self.write_register(REG_CONTROL1, control_1)
-  // }
-  //
-  // fn enable_auto_eeprom_refresh(&mut self) -> Result<(), Error<I2C::Error>> {
-  //   let mut control_1 = self.read_register(REG_CONTROL1)?;
-  //   control_1 &= !(EERD_BIT); // Clear EERD bit
-  //   self.write_register(REG_CONTROL1, control_1)
-  // }
-  //
-  // pub fn eeprom_read(&mut self, address: u8) -> Result<u8, Error<I2C::Error>> {
-  //   self.disable_auto_eeprom_refresh()?;
-  //   while self.is_eeprom_busy()? {}
-  //   // Read from EEPROM
-  //   self.write_register(EEPROM_ADDRESS, address)?;
-  //   let res = self.read_register(EEPROM_ADDRESS);
-  //   self.enable_auto_eeprom_refresh()?;
-  //   res
-  // }
-  //
-  // pub fn eeprom_write(&mut self, address: u8, data: u8) -> Result<(), Error<I2C::Error>> {
-  //   self.disable_auto_eeprom_refresh()?;
-  //   while self.is_eeprom_busy()? {}
-  //   self.write_register(EEPROM_ADDRESS, address)?;
-  //   let res = self.write_register(EEPROM_ADDRESS, data);
-  //
-  //   self.enable_auto_eeprom_refresh()?;
-  //   res
-  // }
 
   // // set specific bits in a register:
   // // all bits must be high that you wish to set
