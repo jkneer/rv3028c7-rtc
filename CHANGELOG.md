@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.1] - Unreleased
 
 ### Added
+- Explicit `write_register(address, value)` raw-byte access for application-owned
+  register uses, with pre-I/O bounds checking and preserved mux/bus errors.
+  Typed configuration and flag methods remain the normal interface.
 - Read-only `get_status()` with `StatusSnapshot` and decoded `StatusFlags`, plus
   `read_register` / `read_registers` for the raw 0x00–0x3F register map.
   Burst reads validate ranges before I/O, support no-op empty slices and never

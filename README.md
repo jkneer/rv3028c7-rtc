@@ -222,6 +222,12 @@ not perform BCD validation, counter stabilization or hour-mode conversion;
 use the corresponding typed methods when those guarantees are needed.
 The HAL must meet the chip's transfer deadlines for calendar/timestamp blocking.
 
+`write_register(address, value)` is an explicit low-level escape hatch for
+application-owned register uses. It sends the byte unchanged after checking
+0x00–0x3F bounds. It performs no readback, field validation or EEPROM protocol.
+The caller must choose a writable implemented register and obey its command,
+write-zero-to-clear or RAM-mirror semantics; prefer typed methods otherwise.
+
 ### User RAM
 
 The RTC has two general-purpose RAM bytes at registers 0x1F and 0x20.

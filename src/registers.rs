@@ -1,4 +1,4 @@
-//! Read-only technical status and raw register access.
+//! Read-only technical status and explicit raw register access.
 use crate::{Error, RV3028};
 use embedded_hal::i2c::I2c;
 
@@ -115,6 +115,27 @@ impl<I: I2c> RV3028<I> {
     }
     self.select_mux_channel()?;
     self.read_multi_registers_raw(register, bytes)
+  }
+
+  /// Write one raw register byte at an address in 0x00–0x3F.
+  ///
+  /// This is an explicit low-level escape hatch. The byte is sent unchanged;
+  /// no field validation, read-modify-write, readback, retry or EEPROM protocol
+  /// is performed. The caller must choose a writable, implemented register
+  /// and obey its semantics. In particular Status uses write-zero-to-clear,
+  /// command registers trigger actions, and configuration writes change RAM
+  /// mirrors only. Reserved and read-only addresses are not made writable.
+  /// Prefer typed methods for normal configuration and flag acknowledgement.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for an address outside 0x00–0x3F, before mux/I/O.
+  /// [`Error::I2c`] for mux or bus failures; a write may have partially completed.
+  pub fn write_register(&mut self, register: u8, value: u8) -> Result<(), Error<I::Error>> {
+    if usize::from(register) >= REGISTER_COUNT {
+      return Err(Error::InvalidData);
+    }
+    self.select_mux_channel()?;
+    self.write_register_raw(register, value)
   }
 
   /// Read Status, Control 1/2, GP Bits, Clock Interrupt Mask and Event Control

@@ -99,3 +99,38 @@ fn status_and_raw_reads_preserve_mux_and_bus_errors_without_retry() {
   assert_eq!(rtc.get_status(), Err(Error::I2c(ErrorKind::Bus)));
   rtc.i2c.done();
 }
+
+#[test]
+fn raw_writes_preserve_all_byte_values_and_validate_before_mux_access() {
+  let expected = [
+    T::write(0x70, vec![1]),
+    T::write(0x52, vec![0x07, 0xFF]),
+    T::write(0x70, vec![1]),
+    T::write(0x52, vec![0x3F, 0x00]),
+  ];
+  let mut rtc = RV3028::new_with_mux(Mock::new(&expected), 0x70, 1);
+  for address in 0x40..=0xFF {
+    assert_eq!(rtc.write_register(address, 0xA5), Err(Error::InvalidData));
+  }
+  rtc.write_register(0x07, 0xFF).unwrap();
+  rtc.write_register(0x3F, 0x00).unwrap();
+  rtc.i2c.done();
+}
+
+#[test]
+fn raw_writes_preserve_mux_and_write_errors_without_readback_or_retry() {
+  let expected = [T::write(0x70, vec![1]).with_error(ErrorKind::ArbitrationLoss)];
+  let mut rtc = RV3028::new_with_mux(Mock::new(&expected), 0x70, 1);
+  assert_eq!(
+    rtc.write_register(0x07, 0x6F),
+    Err(Error::I2c(ErrorKind::ArbitrationLoss))
+  );
+  rtc.i2c.done();
+  let expected = [T::write(0x52, vec![0x07, 0x6F]).with_error(ErrorKind::Bus)];
+  let mut rtc = RV3028::new(Mock::new(&expected));
+  assert_eq!(
+    rtc.write_register(0x07, 0x6F),
+    Err(Error::I2c(ErrorKind::Bus))
+  );
+  rtc.i2c.done();
+}
