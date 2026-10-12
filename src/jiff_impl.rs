@@ -217,8 +217,7 @@ mod tests {
   fn test_set_date_alarm() {
     let expectations = [
       // clear AF
-      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_STATUS], vec![0xFF]),
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0xFB]),
+      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x7B]),
       // set WADA for a date alarm
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL1], vec![0x00]),
       I2cTrans::write(RV3028_ADDRESS, vec![REG_CONTROL1, 0x20]),
@@ -227,8 +226,7 @@ mod tests {
       I2cTrans::write(RV3028_ADDRESS, vec![REG_HOURS_ALARM, 0x93]),
       I2cTrans::write(RV3028_ADDRESS, vec![REG_WEEKDAY_DATE_ALARM, 0x15]),
       // clear AF again
-      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_STATUS], vec![0x04]),
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x00]),
+      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x7B]),
     ];
     let mut rv3028 = RV3028::new(I2cMock::new(&expectations));
     rv3028.set_alarm(&test_datetime(), None, true, false, true).unwrap();
@@ -239,8 +237,7 @@ mod tests {
   fn test_set_weekday_alarm() {
     let expectations = [
       // clear AF
-      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_STATUS], vec![0x00]),
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x00]),
+      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x7B]),
       // clear WADA for a weekday alarm
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL1], vec![0x20]),
       I2cTrans::write(RV3028_ADDRESS, vec![REG_CONTROL1, 0x00]),
@@ -249,8 +246,7 @@ mod tests {
       // Wednesday, not matched
       I2cTrans::write(RV3028_ADDRESS, vec![REG_WEEKDAY_DATE_ALARM, 0x82]),
       // clear AF again
-      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_STATUS], vec![0x00]),
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x00]),
+      I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x7B]),
     ];
     let mut rv3028 = RV3028::new(I2cMock::new(&expectations));
     rv3028.set_alarm(&test_datetime(), Some(Weekday::Wednesday), false, true, true).unwrap();

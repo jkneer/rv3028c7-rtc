@@ -233,6 +233,10 @@ enum TimerClockFreq {
   HertzSixtieth = 0b11, // 1/60 Hz, One minute period
 }
 
+// Status bits 6–0 are write-zero-to-clear; EEbusy (bit 7) is read-only.
+// Writing ones preserves unrelated flags, including events arriving after a read.
+const STATUS_WRITABLE_FLAGS: u8 = 0b0111_1111;
+
 // REG_STATUS Status register bits:
 #[repr(u8)]
 enum RegStatusBits {
@@ -619,6 +623,10 @@ impl<I2C> RV3028<I2C>
   /// The flag value 1 is retained until a 0 is written by the user.
   /// At power up (POR) the value is set to 1, the user has to write 0 to the flag to use it.
   ///
+  /// Reports the flag observed in the initial read and, if set, acknowledges
+  /// only that flag. Unrelated flags, including newly arriving events, are
+  /// preserved. Multiple events on the same one-bit flag cannot be distinguished.
+  ///
   /// # Errors
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
@@ -631,6 +639,10 @@ impl<I2C> RV3028<I2C>
   /// Check whether an external event has been detected
   /// (an appropriate input signal on the EVI pin)
   ///
+  /// Reports the flag observed in the initial read and, if set, acknowledges
+  /// only that flag. Unrelated flags, including newly arriving events, are
+  /// preserved. Multiple events on the same one-bit flag cannot be distinguished.
+  ///
   /// # Errors
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
@@ -642,6 +654,10 @@ impl<I2C> RV3028<I2C>
 
   /// Check whether a switchover to the backup power supply has occurred
   /// (the Backup Switch Flag, BSF)
+  ///
+  /// Reports the flag observed in the initial read and, if set, acknowledges
+  /// only that flag. Unrelated flags, including newly arriving events, are
+  /// preserved. Multiple events on the same one-bit flag cannot be distinguished.
   ///
   /// # Errors
   ///
@@ -674,9 +690,12 @@ impl<I2C> RV3028<I2C>
   //   self.clear_reg_bits_raw(reg,bits)
   // }
 
-  // Clears specific bits in a register, skips the mux.
-  // All bits must be high that you wish to be cleared
+  // Clears selected bits without selecting the mux. Status flags require a
+  // direct write-zero-to-clear acknowledgement, not read–modify–write.
   fn clear_reg_bits_raw(&mut self, reg: u8, bits: u8) -> Result<(), Error<I2C::Error>> {
+    if reg == REG_STATUS {
+      return self.write_register_raw(REG_STATUS, STATUS_WRITABLE_FLAGS & !bits);
+    }
     let mut reg_val = self.read_register_raw(reg)?;
     reg_val &= !(bits); // Clear  bits that are high
     self.write_register_raw(reg, reg_val)
@@ -1018,8 +1037,9 @@ impl<I2C> RV3028<I2C>
   }
 
 
-  /// Clear all of the status registers that indicate whether
-  /// various conditions have triggered
+  /// Clear all seven writable Status flags with one write; EEbusy is read-only.
+  /// This deliberately acknowledges all events, including ones arriving before
+  /// the write. Use the individual check-and-clear methods to preserve unrelated flags.
   ///
   /// # Errors
   ///
@@ -1111,6 +1131,10 @@ impl<I2C> RV3028<I2C>
 
   /// Check the alarm status, and if it's triggered, clear it
   /// return bool indicating whether the alarm triggered
+  ///
+  /// Reports the flag observed in the initial read and, if set, acknowledges
+  /// only that flag. Unrelated flags, including newly arriving events, are
+  /// preserved. Multiple events on the same one-bit flag cannot be distinguished.
   ///
   /// # Errors
   ///
@@ -1373,6 +1397,10 @@ impl<I2C> RV3028<I2C>
 
   /// Check whether countdown timer has finished counting down, and clear it
   ///
+  /// Reports the flag observed in the initial read and, if set, acknowledges
+  /// only that flag. Unrelated flags, including newly arriving events, are
+  /// preserved. Multiple events on the same one-bit flag cannot be distinguished.
+  ///
   /// # Errors
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
@@ -1396,7 +1424,9 @@ impl<I2C> RV3028<I2C>
     Ok(value)
   }
 
-  // check and clear a flag
+  // Returns only the flags observed in the initial read. A later event on an
+  // unrelated flag is preserved; a second event on the acknowledged flag cannot
+  // be distinguished from the first by the chip's single-bit latch.
   fn check_and_clear_bits(&mut self, reg: u8, bits: u8) -> Result<u8, Error<I2C::Error>> {
     self.select_mux_channel()?;
     let reg_val = self.read_register_raw(reg)?;
@@ -2084,3 +2114,6 @@ mod tests {
     rtc.i2c.done();
   }
 }
+
+#[cfg(test)]
+mod status_tests;
