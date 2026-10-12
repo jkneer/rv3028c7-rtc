@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.1] - Unreleased
 
 ### Added
+- Typed `HourMode` with read-only getter and guarded setter. Mode changes convert
+  Hours Alarm, preserve its matching enable and pause/restore AIE. Active capture
+  or any retained timestamp bytes prevent a change without discarding events.
 - Explicit `write_register(address, value)` raw-byte access for application-owned
   register uses, with pre-I/O bounds checking and preserved mux/bus errors.
   Typed configuration and flag methods remain the normal interface.
@@ -46,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BCD/date/time/weekday and normalizes the current 12-/24-hour encoding.
 
 ### Fixed
+- Alarm reads and writes encode/decode the current 12-/24-hour mode, including
+  midnight/noon and AM/PM, while public hours remain 0–23 in all backends.
+- EVI filtering rejects values outside the two-bit ET field before any I/O,
+  preventing unintended changes to other Event Control fields.
+- Countdown conversion uses exact rational clock frequencies rather than rounded
+  microsecond/millisecond periods. Clock selection, downward quantization, zero,
+  minimum and maximum clamping are documented; returned nominal periods match
+  programmed ticks, with fractional nanoseconds truncated.
 - Timestamp readout normalizes 12-hour AM/PM and retains valid captured time
   after Count TS wraps to zero. Invalid legacy timestamp sources are rejected
   before bus access; source changes pause capture before changing TSS.

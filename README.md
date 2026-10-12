@@ -117,6 +117,58 @@ Control 2 and the calendar are separate accesses; exclude concurrent hour-mode
 changes. Unix counter and calendar writes are also separate: a failed operation
 can leave them inconsistent. No rollback, retry, readback or flag clearing occurs.
 
+### Hour mode and alarms
+
+`get_hour_mode()` and `set_hour_mode(HourMode::Hours12 / Hours24)` expose
+Control 2's 12_24 field. Calendar, timestamp and alarm APIs use civil hours 0–23
+in either mode; the driver encodes and decodes AM/PM. Alarm setters/readers,
+including the chrono and jiff backends, use the current mode and preserve each
+alarm field's matching enable.
+
+The chip automatically converts its running Hours register on a mode change,
+but requires Hours Alarm to be rewritten. The setter pauses AIE, changes the
+mode, converts the stored alarm hour, then restores AIE. Other Control 2 bits,
+alarm minute/day, Unix counter and status flags are preserved; RESET is never
+issued. AF may still latch during the transition and is not acknowledged.
+
+A real mode change requires timestamp capture disabled (`TSE=0`) and all seven
+timestamp registers cleared; otherwise it returns `Error::InvalidData` before
+writes. Captured timestamp hours are read-only and cannot be converted.
+Consume the log, disable capture and explicitly reset the log before switching;
+the owner decides whether to discard events and when to resume capture.
+Requesting the existing mode only reads Control 2.
+
+Invalid enabled alarm hours prevent a change; invalid disabled hours become
+midnight with hour matching still disabled. Exclude concurrent mode, alarm and
+capture changes for the entire operation. Bus failures stop immediately without
+rollback and can leave AIE disabled, the new mode applied or the alarm awaiting
+conversion; the owner must inspect and recover.
+
+### EVI filtering and countdown timer
+
+`config_ext_event_detection(rising, int_enable, filtering, clockout_enable)`
+takes an unshifted two-bit ET value: `0b00` for edge detection, or `0b01`,
+`0b10`, `0b11` for level detection sampled at approximately 3.9 ms, 15.6 ms,
+125 ms respectively. Values above `0b11` return `Error::InvalidData` before
+mux selection or register access. EHL, EIE and CEIE are configured independently;
+timestamp source, overwrite mode and enable are preserved. EVF is acknowledged.
+
+`config_countdown_timer(&duration, repeat, start)` selects the finest clock whose
+full 12-bit range includes the requested duration, then rounds down to whole
+ticks. Its clocks are 4096 Hz, 64 Hz, 1 Hz and 1/60 Hz, with a maximum count of
+4095. Positive durations shorter than one 4096-Hz tick are clamped to one tick;
+durations above 4095 minutes are clamped to that maximum. Zero programs zero
+ticks, for which the hardware does not count down.
+
+The returned duration is the nominal period `ticks / frequency`, with fractional
+nanoseconds truncated. For example, 500 ms programs 2048 ticks at 4096 Hz,
+1 s programs 64 ticks at 64 Hz, and 2047 ms programs 131 ticks at 64 Hz and
+returns 2046.875 ms. At clock-range boundaries, rounding to a coarser source can
+shorten the nominal period. First-period latency also depends on start phase;
+the return value is not a precise first-expiry deadline. See the
+[Application Manual](https://www.microcrystal.com/fileadmin/Media/Products/RTC/App.Manual/RV-3028-C7_App-Manual.pdf),
+sections 3.7–3.8 and 4.8.3.
+
 ### Backup and CLKOUT configuration
 
 `BackupConfig` describes the BSM switchover mode (Disabled, Direct or Level),
@@ -333,6 +385,40 @@ date alarms). Invalid enabled fields return an error. Subseconds are ignored.
 - If you use `default-features = false`, add `features = ["chrono"]` to keep the chrono API.
 
 See the [changelog](./CHANGELOG.md) for details.
+
+## Remaining API coverage
+
+The following chip functions do not yet have dedicated driver APIs. Raw register
+and EEPROM access is available, but does not implement their field validation,
+read-modify-write rules or complete operating sequences:
+
+- **Frequency offset correction (EEOffset):** no signed 9-bit correction type,
+  getter/setter or conversion between correction steps and ppm. A future setter
+  must merge registers 0x36 and 0x37 without changing Backup settings. Existing
+  Backup setters preserve the shared calibration bit; EEPROM persistence is
+  already available separately. Preserve the factory calibration unless an
+  explicit replacement has been determined.
+- **Password/write protection:** no dedicated unlock, password-change or
+  protection-enable/disable sequence. Generic EEPROM methods do not unlock
+  protected accesses automatically.
+- **Explicit prescaler RESET command:** no dedicated method for Control 2 RESET
+  and its documented timing effects. Calendar setters already reset the
+  prescaler by writing Seconds; timestamp-log reset is implemented separately.
+- **Combined interrupt/CLKOUT routing configuration:** no typed configuration
+  spanning Control 2 interrupt enables and Clock Interrupt Mask. Individual
+  interrupt toggles, CLKIE toggle and mask clearing exist, and technical readout
+  exposes the raw control/mask bytes.
+
+Additional API gaps concern functions that are already implemented: EVI filtering
+uses a validated raw two-bit ET argument rather than a typed enum, and countdown
+configuration accepts a duration rather than an explicit clock/tick preset.
+There are no dedicated configuration getters for those two functions.
+
+Hour-mode switching, 12-hour alarm encoding, timestamp logging, Backup/CLKOUT
+configuration, calendar access and User RAM/EEPROM access are implemented.
+Reference: Application Manual rev. 1.4, especially sections 4.15, 4.17 and 4.18.
+Drift measurement, calibration policy and board-specific defaults belong to the
+owner, rather than being missing hardware-driver features.
 
 ## Running examples
 

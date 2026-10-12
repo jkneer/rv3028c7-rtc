@@ -210,6 +210,7 @@ mod tests {
   #[test]
   fn test_set_date_alarm() {
     let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       // clear AF
       I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x7B]),
       // set WADA for a date alarm
@@ -230,6 +231,7 @@ mod tests {
   #[test]
   fn test_set_weekday_alarm() {
     let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       // clear AF
       I2cTrans::write(RV3028_ADDRESS, vec![REG_STATUS, 0x7B]),
       // clear WADA for a weekday alarm
@@ -250,6 +252,7 @@ mod tests {
   #[test]
   fn test_get_date_alarm() {
     let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_WEEKDAY_DATE_ALARM], vec![0x15]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_HOURS_ALARM], vec![0x93]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_MINUTES_ALARM], vec![0x45]),
@@ -267,6 +270,7 @@ mod tests {
   #[test]
   fn test_get_weekday_alarm() {
     let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_WEEKDAY_DATE_ALARM], vec![0x82]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_HOURS_ALARM], vec![0x13]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_MINUTES_ALARM], vec![0x45]),

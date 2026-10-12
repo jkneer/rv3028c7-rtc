@@ -14,6 +14,40 @@
 //! such as the countdown timer, interrupts, trickle charging and the unix time counter,
 //! is always available.
 //!
+//! # Remaining API coverage
+//!
+//! The following chip functions do not yet have dedicated driver APIs. Raw register
+//! and EEPROM access is available, but does not implement their field validation,
+//! read-modify-write rules or complete operating sequences:
+//!
+//! - **Frequency offset correction (EEOffset):** no signed 9-bit correction type,
+//!   getter/setter or conversion between correction steps and ppm. A future setter
+//!   must merge registers 0x36 and 0x37 without changing Backup settings. Existing
+//!   Backup setters preserve the shared calibration bit; EEPROM persistence is
+//!   already available separately. Preserve the factory calibration unless an
+//!   explicit replacement has been determined.
+//! - **Password/write protection:** no dedicated unlock, password-change or
+//!   protection-enable/disable sequence. Generic EEPROM methods do not unlock
+//!   protected accesses automatically.
+//! - **Explicit prescaler RESET command:** no dedicated method for Control 2 RESET
+//!   and its documented timing effects. Calendar setters already reset the
+//!   prescaler by writing Seconds; timestamp-log reset is implemented separately.
+//! - **Combined interrupt/CLKOUT routing configuration:** no typed configuration
+//!   spanning Control 2 interrupt enables and Clock Interrupt Mask. Individual
+//!   interrupt toggles, CLKIE toggle and mask clearing exist, and technical readout
+//!   exposes the raw control/mask bytes.
+//!
+//! Additional API gaps concern functions that are already implemented: EVI filtering
+//! uses a validated raw two-bit ET argument rather than a typed enum, and countdown
+//! configuration accepts a duration rather than an explicit clock/tick preset.
+//! There are no dedicated configuration getters for those two functions.
+//!
+//! Hour-mode switching, 12-hour alarm encoding, timestamp logging, Backup/CLKOUT
+//! configuration, calendar access and User RAM/EEPROM access are implemented.
+//! Reference: Application Manual rev. 1.4, especially sections 4.15, 4.17 and 4.18.
+//! Drift measurement, calibration policy and board-specific defaults belong to the
+//! owner, rather than being missing hardware-driver features.
+//!
 //! # Example
 //!
 //! ```
@@ -60,6 +94,13 @@ mod jiff_impl;
 pub use jiff;
 #[cfg(feature = "jiff")]
 pub use jiff_impl::JiffDateTimeAccess;
+
+mod hour_mode;
+pub use hour_mode::HourMode;
+#[cfg(test)]
+mod hour_mode_tests;
+#[cfg(test)]
+mod event_timer_tests;
 
 mod registers;
 pub use registers::{REGISTER_COUNT, StatusFlags, StatusSnapshot};
@@ -1281,6 +1322,7 @@ impl<I2C> RV3028<I2C>
   /// All-in-one method to set an alarm:
   /// See the App Note section "Procedure to use the Alarm Interrupt".
   /// Only day (or weekday), hour and minute are supported; see [`AlarmParts`].
+  /// Hours are 0–23, encoded according to the current 12-/24-hour mode.
   /// All fields, including disabled fields, must be valid; checked before bus access.
   ///
   /// # Errors
@@ -1294,6 +1336,7 @@ impl<I2C> RV3028<I2C>
 
     alarm.validate()?;
     self.select_mux_channel()?;
+    let control2 = self.read_register_raw(REG_CONTROL2)?;
     // Initialize AF to 0; AIE/AlarmIntEnableBit is managed independently
     self.clear_reg_bits_raw(REG_STATUS, RegStatusBits::AlarmFlagBit as u8)?;
 
@@ -1314,7 +1357,7 @@ impl<I2C> RV3028<I2C>
                         if alarm.match_minute { bcd_minute }
                         else { ALARM_NO_WATCH_FLAG | bcd_minute })?;
 
-    let bcd_hour = Self::bin_to_bcd(alarm.hour);
+    let bcd_hour = Self::encode_calendar_hour(alarm.hour, control2);
     self.write_register_raw(REG_HOURS_ALARM,
                         if alarm.match_hour { bcd_hour  }
                         else { ALARM_NO_WATCH_FLAG | bcd_hour })?;
@@ -1331,7 +1374,8 @@ impl<I2C> RV3028<I2C>
     Ok(())
   }
 
-  /// Read the alarm settings. Invalid enabled fields return [`Error::InvalidData`].
+  /// Read the alarm settings, normalizing hours to 0–23 in both hour modes.
+  /// Invalid enabled fields return [`Error::InvalidData`].
   /// Invalid disabled fields become zero (or day 1 for a date alarm).
   ///
   /// # Errors
@@ -1344,6 +1388,7 @@ impl<I2C> RV3028<I2C>
   pub fn get_alarm_parts(&mut self) -> Result<AlarmParts, Error<I2C::Error>> {
 
     self.select_mux_channel()?;
+    let control2 = self.read_register_raw(REG_CONTROL2)?;
 
     let raw_day = self.read_register_raw(REG_WEEKDAY_DATE_ALARM)?;
     let match_day = 0 == (raw_day & ALARM_NO_WATCH_FLAG);
@@ -1351,7 +1396,7 @@ impl<I2C> RV3028<I2C>
 
     let raw_hour = self.read_register_raw(REG_HOURS_ALARM)?;
     let match_hour = 0 == (raw_hour & ALARM_NO_WATCH_FLAG);
-    let hour = Self::checked_bcd(0x7F & raw_hour);
+    let hour = Self::calendar_hour(0x7F & raw_hour, control2);
 
     let raw_minutes = self.read_register_raw(REG_MINUTES_ALARM)?;
     let match_minutes = 0 == (raw_minutes & ALARM_NO_WATCH_FLAG);
@@ -1431,7 +1476,7 @@ impl<I2C> RV3028<I2C>
     self.set_or_clear_reg_bits_raw(REG_CONTROL1, RegControl1Bits::TimerRepeatBit as u8, repeat)?;
 
     self.clear_reg_bits_raw(REG_CONTROL1, RegControl1Bits::TimerClockFreqBits as u8)?;
-    self.set_reg_bits_raw(REG_CONTROL1, freq as u8)?; //TODO verify
+    self.set_reg_bits_raw(REG_CONTROL1, freq as u8)?; // Frequency selector is the unshifted TD field.
 
     // write to REG_TIMER_VALUE0 and REG_TIMER_VALUE1
     let write_buf = [ REG_TIMER_VALUE0, value_low, value_high];
@@ -1442,61 +1487,42 @@ impl<I2C> RV3028<I2C>
   }
 
   const MAX_PCT_TICKS: u16 = 0x0FFF; // 4095
-  const PCT_MILLIS_PERIOD:i64 = 15; // 15.625 ms period
-  const PCT_MICROS_PERIOD:i64 = 244; // 244.14 μs period
-
-  const MAX_PCT_COUNT:i64 = Self::MAX_PCT_TICKS as i64;
-  const MAX_PCT_MILLIS:i64 = Self::MAX_PCT_COUNT * Self::PCT_MILLIS_PERIOD;
-  const MAX_PCT_MICROS:i64 = Self::MAX_PCT_COUNT * Self::PCT_MICROS_PERIOD;
-  const PCT_MILLIS_SECOND_BARRIER: i64 =  Self::PCT_MILLIS_PERIOD*(1000/Self::PCT_MILLIS_PERIOD);
-
-  // Calculate the closest clock frequency and
-  // number of ticks to match the requested duration using the
-  // Periodic Countdown Timer (PCT)
-  fn pct_ticks_and_rate_for_duration(duration: &Duration) -> (u16, TimerClockFreq, Duration)
-  {
-    // saturate rather than overflow: anything this large is clamped to the maximum below
-    let whole_seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
-    let whole_minutes = whole_seconds / 60;
-    let whole_milliseconds = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-    let frac_milliseconds = whole_milliseconds % 1_000;
-    let infrac_milliseconds = whole_milliseconds % Self::PCT_MILLIS_PERIOD;
-    let whole_microseconds = i64::try_from(duration.as_micros()).unwrap_or(i64::MAX);
-
-    return if whole_minutes >= Self::MAX_PCT_COUNT {
-      (Self::MAX_PCT_TICKS, TimerClockFreq::HertzSixtieth, Duration::from_secs(Self::MAX_PCT_COUNT as u64 * 60))
-    } else if whole_seconds > Self::MAX_PCT_COUNT {
-      // use minutes
-      let ticks = whole_minutes;
-      (ticks as u16, TimerClockFreq::HertzSixtieth, Duration::from_secs(ticks as u64 * 60))
-    } else if  (whole_milliseconds > Self::MAX_PCT_MILLIS) ||
-      ((0 == frac_milliseconds) && (whole_milliseconds > Self::PCT_MILLIS_SECOND_BARRIER))  {
-      // use seconds
-      let ticks = whole_seconds;
-      (ticks as u16, TimerClockFreq::Hertz1, Duration::from_secs(ticks as u64))
-    } else if (whole_microseconds > Self::MAX_PCT_MICROS) ||
-      ((0 == infrac_milliseconds) && (whole_milliseconds >= Self::PCT_MILLIS_PERIOD)) {
-      // use milliseconds
-      let ticks = whole_milliseconds / Self::PCT_MILLIS_PERIOD;
-      (ticks as u16, TimerClockFreq::Hertz64,
-       Duration::from_millis((ticks * Self::PCT_MILLIS_PERIOD) as u64))
-    } else {
-      // use microseconds
-      let ticks = whole_microseconds / Self::PCT_MICROS_PERIOD;
-      (ticks as u16, TimerClockFreq::Hertz4096,
-       Duration::from_micros((ticks * Self::PCT_MICROS_PERIOD) as u64))
+  // Select the finest source whose full 12-bit range includes the request.
+  // Use rational frequency arithmetic; Duration truncates fractional nanoseconds.
+  fn pct_ticks_and_rate_for_duration(duration: &Duration) -> (u16, TimerClockFreq, Duration) {
+    let nanos = duration.as_nanos();
+    for (freq, numerator, denominator) in [
+      (TimerClockFreq::Hertz4096, 4096u128, 1u128),
+      (TimerClockFreq::Hertz64, 64, 1),
+      (TimerClockFreq::Hertz1, 1, 1),
+      (TimerClockFreq::HertzSixtieth, 1, 60),
+    ] {
+      let scaled = nanos * numerator;
+      let unit = 1_000_000_000 * denominator;
+      if scaled <= u128::from(Self::MAX_PCT_TICKS) * unit {
+        let ticks = if nanos == 0 { 0 } else { (scaled / unit).max(1) };
+        let period_ns = ticks * unit / numerator;
+        return (ticks as u16, freq, Duration::from_nanos(period_ns as u64));
+      }
     }
-
+    (Self::MAX_PCT_TICKS, TimerClockFreq::HertzSixtieth,
+      Duration::from_secs(u64::from(Self::MAX_PCT_TICKS) * 60))
   }
 
   /// Prepare the Periodic Countdown Timer for a countdown,
   /// and optionally start the countdown.
   ///
   /// - `repeat`: If true, the countdown timer will repeat as a periodic timer.
-  /// If false, the countdown timer will only run once ("one-shot" mode).
-  /// Returns the estimated actual duration (which may vary from the requested duration
-  /// dur to discrete RTC clock ticks).
-  /// - `start`: If true, start the countdown
+  ///   If false, the countdown timer will only run once ("one-shot" mode).
+  /// - `start`: If true, start the countdown.
+  ///
+  /// Selects the finest clock whose full 12-bit range includes the request and
+  /// rounds down to whole ticks. Positive requests below one 4096-Hz tick are
+  /// clamped to one tick; durations above 4095 minutes are clamped to that maximum.
+  /// Zero programs zero ticks (the chip does not count down).
+  /// Returns the nominal period, truncating fractional nanoseconds only.
+  /// This is not the first-period latency: starting the timer has a phase-dependent
+  /// additional delay, as specified in Application Manual section 4.8.3.
   ///
   /// # Errors
   ///
@@ -1573,25 +1599,30 @@ impl<I2C> RV3028<I2C>
   /// Configure event detection on the EVI pin
   /// - `rising` whether edge detection is on rising edge / high level
   /// - `int_enable` whether events detected on EVI pin should generate an interrupt on INT pin
-  /// - `filtering` 00..11 time filtering
+  /// - `filtering`: unshifted ET field, 0b00 (edge detection), 0b01 (3.9 ms),
+  ///   0b10 (15.6 ms), or 0b11 (125 ms) level filtering.
+  /// - `clockout_enable`: enable clock output following an EVI event.
   ///
   /// # Errors
+  ///
+  /// [`Error::InvalidData`] if `filtering` exceeds 0b11, before any bus access.
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
   pub fn config_ext_event_detection(
     &mut self, rising: bool, int_enable: bool, filtering: u8, clockout_enable: bool) -> Result<(), Error<I2C::Error>>
   {
+    if filtering > 0b11 { return Err(Error::InvalidData); }
     self.select_mux_channel()?;
 
-    // 1. Initialize bits TSE and EIE to 0.
-    // 2. Clear flag EVF to 0.
+    // Timestamp capture is managed separately; this method only pauses EIE.
+    // Clear EVF and update the EVI detection and routing fields.
     // 4. Set EHL bit to 1 or 0 to choose high or low level (or rising or falling edge) detection on pin EVI.
     // 5. Select EDGE DETECTION (ET = 00) or LEVEL DETECTION WITH FILTERING (ET ≠ 00).
     // 8. Set CEIE bit to 1 to enable clock output when external event occurs. See also CLOCK OUTPUT SCHEME.
     // 10. Set EIE bit to 1 if you want to get a hardware interrupt on INT̅ ̅ ̅ ̅ ̅
     // pin.
 
-    // Pause listening for external events on EVI pin
+    // Pause external-event interrupt output; timestamp capture is unchanged.
     // 1. Initialize EIE to 0.
     self.clear_reg_bits_raw(REG_CONTROL2,
                               RegControl2Bits::EventIntEnableBit  as u8)?;
@@ -1607,7 +1638,7 @@ impl<I2C> RV3028<I2C>
     // 5. Select EDGE DETECTION (ET = 00) or LEVEL DETECTION WITH FILTERING (ET ≠ 00).
     self.clear_reg_bits_raw(REG_EVENT_CONTROL,RegEventControlBits::EventFilteringTimeBits as u8)?;
     if 0 != filtering {
-      // TODO verify this sets the correct filtering
+      // Validated ET field, shifted into bits 5:4.
       self.set_reg_bits_raw(REG_EVENT_CONTROL, filtering << 4)?;
     }
 
@@ -1735,12 +1766,6 @@ mod tests {
   use std::vec;
 
 
-  type TestClass = RV3028<I2cMock>;
-
-  fn mins(n: i64) -> Duration { Duration::from_secs(n as u64 * 60) }
-  fn secs(n: i64) -> Duration { Duration::from_secs(n as u64) }
-  fn millis(n: i64) -> Duration { Duration::from_millis(n as u64) }
-  fn micros(n: i64) -> Duration { Duration::from_micros(n as u64) }
 
 
   #[test]
@@ -1787,176 +1812,6 @@ mod tests {
     rv3028.i2c.done();
   }
 
-  // The duration requested should exactly match the duration the RTC can deliver with
-  // pct_ticks_and_rate_for_duration
-  fn verify_whole_time_estimate(duration: &Duration, known_freq: TimerClockFreq, known_ticks: u16) {
-    let (ticks, freq, estimated) =
-      TestClass::pct_ticks_and_rate_for_duration(&duration);
-    assert_eq!(freq, known_freq);
-    assert_eq!(ticks, known_ticks);
-    assert_eq!(*duration, estimated);
-  }
-
-  // We know that the RTC can't precisely match the requested duration with
-  // pct_ticks_and_rate_for_duration, so just match ticks and freq
-  fn verify_ticks_and_freq(duration: &Duration, known_freq: TimerClockFreq, known_ticks: u16) {
-    let (ticks, freq, _estimated) =
-      TestClass::pct_ticks_and_rate_for_duration(&duration);
-    assert_eq!(freq, known_freq);
-    assert_eq!(ticks, known_ticks);
-    // assert_eq!(*duration, estimated); // TODO calculate
-  }
-
-  #[test]
-  fn test_countdown_timer_conversion_minutes() {
-    // should be fulfilled as minutes
-    let minutes_clock_freq = TimerClockFreq::HertzSixtieth;
-
-    // request a longer countdown than th RTC can fulfill
-    verify_ticks_and_freq(
-      &mins(TestClass::MAX_PCT_COUNT + 32),
-      minutes_clock_freq, TestClass::MAX_PCT_TICKS);
-
-    verify_whole_time_estimate(
-      &mins(TestClass::MAX_PCT_COUNT),
-      minutes_clock_freq, TestClass::MAX_PCT_TICKS);
-
-    // exceed the Seconds counter just slightly to invoke Minutes counter
-    const MAX_SECONDS_IN_MINUTES: i64 = (TestClass::MAX_PCT_COUNT/ 60) + 1;
-    verify_whole_time_estimate(
-      &mins(MAX_SECONDS_IN_MINUTES),
-      minutes_clock_freq, MAX_SECONDS_IN_MINUTES as u16);
-
-    verify_whole_time_estimate(
-      &mins(2047),
-      minutes_clock_freq, 2047);
-
-  }
-
-  #[test]
-  fn test_countdown_timer_conversion_seconds() {
-    // should be fulfilled as seconds
-    let seconds_clock_freq = TimerClockFreq::Hertz1;
-
-    // Maximum seconds ticks
-    verify_whole_time_estimate(
-      &secs(TestClass::MAX_PCT_COUNT),
-      seconds_clock_freq, TestClass::MAX_PCT_TICKS);
-
-    verify_whole_time_estimate(
-      &secs(2047),
-      seconds_clock_freq, 2047);
-
-    verify_whole_time_estimate(
-      &secs(61),
-      seconds_clock_freq, 61);
-
-    // we serve whole minutes (under max seconds) with a seconds countdown
-    verify_whole_time_estimate(
-      &secs(60),
-      seconds_clock_freq, 60);
-
-    verify_whole_time_estimate(
-      &mins(1),
-      seconds_clock_freq, 60);
-
-    verify_whole_time_estimate(
-      &mins(45),
-      seconds_clock_freq, 45*60);
-
-    // minimum Seconds ticks
-    verify_whole_time_estimate(
-      &secs(1),
-      seconds_clock_freq, 1);
-
-  }
-
-  #[test]
-  fn test_countdown_timer_conversion_micros() {
-    // should be fulfilled as microseconds
-    let micros_clock_freq = TimerClockFreq::Hertz4096;
-
-    verify_whole_time_estimate(
-      &micros(TestClass::MAX_PCT_MICROS),
-      micros_clock_freq, TestClass::MAX_PCT_TICKS);
-
-    verify_ticks_and_freq(
-      &micros(2048),
-      micros_clock_freq, (2048 / TestClass::PCT_MICROS_PERIOD) as u16);
-
-    verify_ticks_and_freq(
-      &micros(655),
-      micros_clock_freq, (655 / TestClass::PCT_MICROS_PERIOD) as u16);
-
-    verify_ticks_and_freq(
-      &micros(1024),
-      micros_clock_freq, (1024 / TestClass::PCT_MICROS_PERIOD) as u16);
-
-    // some exact micros values
-
-    verify_whole_time_estimate(
-      &micros(999*TestClass::PCT_MICROS_PERIOD),
-      micros_clock_freq, 999);
-
-    verify_whole_time_estimate(
-      &micros(100*TestClass::PCT_MICROS_PERIOD),
-      micros_clock_freq, 100);
-
-    verify_whole_time_estimate(
-      &micros(17*TestClass::PCT_MICROS_PERIOD),
-      micros_clock_freq, 17);
-
-    // minimum microseconds tick
-    verify_whole_time_estimate(
-      &micros(TestClass::PCT_MICROS_PERIOD),
-      micros_clock_freq, 1);
-
-  }
-
-  #[test]
-  fn test_countdown_timer_conversion_millis() {
-    // should be fulfilled as milliseconds
-    let millis_clock_freq = TimerClockFreq::Hertz64;
-
-    // a bit more than max micros counter, but less than max millis counter
-    verify_ticks_and_freq(
-      &micros(TestClass::MAX_PCT_MICROS + 1),
-      millis_clock_freq,
-      ((TestClass::MAX_PCT_MICROS + 1) / (TestClass::PCT_MILLIS_PERIOD * 1_000)) as u16
-    );
-
-    // maximum millis counter
-    verify_whole_time_estimate(
-      &millis(TestClass::MAX_PCT_MILLIS),
-      millis_clock_freq, TestClass::MAX_PCT_TICKS);
-
-    // mid-value millis
-    verify_ticks_and_freq(
-      &millis(2047),
-      millis_clock_freq, (2047 / TestClass::PCT_MILLIS_PERIOD) as u16);
-
-    // exactly on the seconds clock
-    verify_whole_time_estimate(
-      &millis(1000*TestClass::PCT_MILLIS_PERIOD),
-      TimerClockFreq::Hertz1, TestClass::PCT_MILLIS_PERIOD as u16 );
-
-    // exactly on the millis period
-
-    verify_whole_time_estimate(
-      &millis(999*TestClass::PCT_MILLIS_PERIOD),
-      millis_clock_freq, 999);
-
-    verify_whole_time_estimate(
-      &millis(100*TestClass::PCT_MILLIS_PERIOD),
-      millis_clock_freq, 100);
-
-    // minimum millis ticks
-    verify_whole_time_estimate(
-      &millis(TestClass::PCT_MILLIS_PERIOD),
-      millis_clock_freq, 1);
-
-  }
-
   // 2024-03-15 13:45:30 UTC, a Friday
   const TEST_PARTS: DateTimeParts =
     DateTimeParts { year: 2024, month: 3, day: 15, hour: 13, minute: 45, second: 30 };
@@ -1999,6 +1854,7 @@ mod tests {
   #[test]
   fn test_get_alarm_parts() {
     let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_WEEKDAY_DATE_ALARM], vec![0x82]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_HOURS_ALARM], vec![0x13]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_MINUTES_ALARM], vec![0x45]),
@@ -2096,6 +1952,7 @@ mod tests {
     for disabled in [false, true] {
       let flag = if disabled { 0x80 } else { 0 };
       let expectations = [
+        I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
         I2cTrans::write_read(RV3028_ADDRESS, vec![REG_WEEKDAY_DATE_ALARM], vec![flag]),
         I2cTrans::write_read(RV3028_ADDRESS, vec![REG_HOURS_ALARM], vec![flag | 0x24]),
         I2cTrans::write_read(RV3028_ADDRESS, vec![REG_MINUTES_ALARM], vec![flag | 0x6A]),
