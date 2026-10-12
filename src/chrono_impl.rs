@@ -161,8 +161,8 @@ impl<I2C> ChronoAccess for RV3028<I2C>
 mod tests {
   use super::*;
   use crate::{
-    REG_CONTROL1, REG_COUNT_EVENTS_TS, REG_HOURS_ALARM, REG_MINUTES_ALARM, REG_SECONDS, REG_STATUS,
-    REG_UNIX_TIME_0, REG_WEEKDAY, REG_WEEKDAY_DATE_ALARM, RV3028_ADDRESS,
+    REG_CONTROL1, REG_CONTROL2, REG_COUNT_EVENTS_TS, REG_HOURS_ALARM, REG_MINUTES_ALARM, REG_SECONDS, REG_STATUS,
+    REG_UNIX_TIME_0, REG_WEEKDAY_DATE_ALARM, RV3028_ADDRESS,
   };
   use embedded_hal_mock::eh1::i2c::{Mock as I2cMock, Transaction as I2cTrans};
   use std::vec;
@@ -196,12 +196,11 @@ mod tests {
     let unix_bytes = (dt.and_utc().timestamp() as u32).to_le_bytes();
     let expectations = [
       I2cTrans::write(MUX_ADDR, vec![MUX_CHAN]),
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write(RV3028_ADDRESS, vec![
         REG_UNIX_TIME_0, unix_bytes[0], unix_bytes[1], unix_bytes[2], unix_bytes[3]]),
-      // weekday, day, month, year
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_WEEKDAY, 0x04, 0x15, 0x03, 0x24]),
-      // seconds, minutes, hours
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_SECONDS, 0x30, 0x45, 0x13]),
+      // One coherent calendar burst: seconds through year.
+      I2cTrans::write(RV3028_ADDRESS, vec![REG_SECONDS, 0x30, 0x45, 0x13, 0x04, 0x15, 0x03, 0x24]),
     ];
     let mut rv3028 = RV3028::new_with_mux(I2cMock::new(&expectations), MUX_ADDR, MUX_CHAN);
     rv3028.set_datetime(&dt).unwrap();

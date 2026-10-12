@@ -82,6 +82,41 @@ let mut rtc1 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b0000_0
 let mut rtc2 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b1000_0000);
 ```
 
+### Calendar access
+
+`set_datetime_parts(&parts)` and both backend `set_datetime` methods write
+the Unix counter first, then all seven calendar registers (0x00–0x06) in one
+coherent burst. They use the existing 12-/24-hour mode without changing Control 2
+or alarm configuration. Input hours are always 0–23.
+
+`set_seconds`, `set_minutes`, `set_hours`, `set_weekday`, `set_day`,
+`set_month` and `set_year` write individual calendar registers. Arguments are
+ordinary binary values, with hours 0–23, years 2000–2099 and Monday=0 weekdays.
+Only the supplied field is range-checked; other fields and the Unix counter
+are unchanged. Date fields can temporarily form an invalid date, and changing
+the date does not recalculate the weekday. Writing seconds resets subseconds;
+the other field setters do not. Use the complete setter for clock synchronization.
+
+`get_datetime_parts()` reads Control 2, then the complete calendar in one burst.
+It normalizes 12-hour AM/PM to hours 0–23 and validates BCD, calendar date, time
+and the Monday=0 weekday. It does not check or acknowledge PORF.
+
+```rust
+let calendar = rtc.get_datetime_parts()?;
+rtc.set_datetime_parts(&calendar)?;
+```
+
+Backend `datetime()` methods still read the independent Unix counter, rather than
+the calendar. Reading the date and time separately with `get_ymd()` and
+`get_hms()` does not form one coherent full-calendar snapshot.
+
+The [Application Manual](https://www.microcrystal.com/fileadmin/Media/Products/RTC/App.Manual/RV-3028-C7_App-Manual.pdf),
+section 4.5, requires the calendar transfer to finish in less than 950 ms for
+register blocking. The HAL must provide suitable transaction timeouts.
+Control 2 and the calendar are separate accesses; exclude concurrent hour-mode
+changes. Unix counter and calendar writes are also separate: a failed operation
+can leave them inconsistent. No rollback, retry, readback or flag clearing occurs.
+
 ### User RAM
 
 The RTC has two general-purpose RAM bytes at registers 0x1F and 0x20.

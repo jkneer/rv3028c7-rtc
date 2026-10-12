@@ -24,8 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settling delays, bounded busy polling, preservation of the original EERD state,
   and `EepromError` / `EepromErrorKind` retaining operation and restoration failures.
   Existing non-EEPROM error types are unchanged.
+- Individual calendar field setters: `set_seconds`, `set_minutes`, `set_hours`,
+  `set_weekday`, `set_day`, `set_month` and `set_year`. Each validates its own
+  range before I/O and leaves the independent Unix counter unchanged.
+- `get_datetime_parts()` reads the complete calendar in one burst, validates
+  BCD/date/time/weekday and normalizes the current 12-/24-hour encoding.
 
 ### Fixed
+- `get_hms()` uses the existing hour mode and normalizes 12-hour AM/PM values
+  to hours 0–23, sharing the complete calendar reader's hour validation.
+- All datetime setters write seconds through year in one coherent calendar
+  transfer after writing the independent Unix counter. Both hour modes are
+  encoded using the existing Control 2 setting, without modifying alarm setup.
 - Status flag acknowledgements write zeros only to selected flags and ones to
   every unrelated writable flag, without read-modify-write. This prevents loss
   of unrelated events arriving between reads and acknowledgements in alarm,

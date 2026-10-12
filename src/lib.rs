@@ -98,8 +98,8 @@ const RV3028_ADDRESS: u8 = 0xA4 >> 1;
 
 // Main time register addresses
 const REG_SECONDS: u8 = 0x00;
-// const REG_MINUTES: u8 = 0x01;
-// const REG_HOURS: u8 = 0x02;
+const REG_MINUTES: u8 = 0x01;
+const REG_HOURS: u8 = 0x02;
 
 
 // Holds the current day of the week.
@@ -115,8 +115,8 @@ const REG_DATE: u8 = 0x04;
 
 // Holds the current month, in two binary coded decimal (BCD) digits.
 // Values will range from 01 to 12.
-// const REG_MONTH: u8 = 0x05;
-// const REG_YEAR: u8 = 0x06;
+const REG_MONTH: u8 = 0x05;
+const REG_YEAR: u8 = 0x06;
 
 // Holds the Minutes Alarm Enable bit AE_M,
 // and the alarm value for minutes,
@@ -778,50 +778,24 @@ impl<I2C> RV3028<I2C>
     Ok(reg_val)
   }
 
-  // Set the bcd time tracking registers
-  // assumes `select_mux_channel` has already been called
-  fn set_time_raw(&mut self, dt: &DateTimeParts) -> Result<(), Error<I2C::Error>> {
-    let write_buf = [
-      REG_SECONDS, // select the first register
-      Self::bin_to_bcd(dt.second),
-      Self::bin_to_bcd(dt.minute),
-      Self::bin_to_bcd(dt.hour)
-    ];
-    self.i2c.write(RV3028_ADDRESS, &write_buf).map_err(Error::I2c)
-  }
-
-
-  // Set the internal BCD date registers.
-  // Note that only years from 2000 to 2099 are supported.
-  // `weekday` is 0 for Monday through 6 for Sunday.
-  // Assumes `select_mux_channel` has already been called
-  fn set_date_raw(&mut self, dt: &DateTimeParts, weekday: u8) -> Result<(), Error<I2C::Error>> {
-    let year = if dt.year > 2000 { (dt.year - 2000) as u8} else {0};
-    let month = dt.month % 13;
-    let day = dt.day % 32;
-    let weekday = weekday % 7;
-
-    let write_buf = [
-      REG_WEEKDAY, // select the first register
-      Self::bin_to_bcd(weekday ),
-      Self::bin_to_bcd(day ),
-      Self::bin_to_bcd(month ),
-      Self::bin_to_bcd(year )
-    ];
-    self.i2c.write(RV3028_ADDRESS, &write_buf).map_err(Error::I2c)
-  }
-
-  // Set the unix time counter and all BCD date and time registers.
-  // The unix time counter is stored in registers separate from everything else:
-  // this method tries to align both, because the unix timestamp is not
-  // used by eg the Event or Alarm interrupts
+  // Write Unix time first, then one coherent calendar burst. Writing seconds
+  // resets the prescaler; the seven calendar registers share one I2C access.
   fn set_datetime_raw(&mut self, unix_timestamp: u32, dt: &DateTimeParts, weekday: u8) -> Result<(), Error<I2C::Error>> {
     self.select_mux_channel()?;
+    let control2 = self.read_register_raw(REG_CONTROL2)?;
+    let hour = Self::encode_calendar_hour(dt.hour, control2);
+    let packet = [
+      REG_SECONDS,
+      Self::bin_to_bcd(dt.second),
+      Self::bin_to_bcd(dt.minute),
+      hour,
+      weekday,
+      Self::bin_to_bcd(dt.day),
+      Self::bin_to_bcd(dt.month),
+      Self::bin_to_bcd((dt.year - 2000) as u8),
+    ];
     self.set_unix_time_raw(unix_timestamp)?;
-    self.set_date_raw(dt, weekday)?;
-    // this must come last because writing to the seconds register resets
-    // the upper stage of the prescaler
-    self.set_time_raw(dt)
+    self.i2c.write(RV3028_ADDRESS, &packet).map_err(Error::I2c)
   }
 
   /// Set the date and time: both the unix time counter and all internal BCD date and time
@@ -834,6 +808,12 @@ impl<I2C> RV3028<I2C>
   /// subsecond counters are zeroed, when it writes to the Seconds register.
   /// This assists with clock synchronization with external clocks.
   ///
+  /// Uses the existing 12-/24-hour setting without changing Control 2 or alarms.
+  /// Unix time is written first, then all seven calendar bytes in one burst.
+  /// These transfers are not atomic together: a bus/power failure may leave
+  /// counter and calendar inconsistent. No readback or flag clearing is done.
+  /// The calendar transfer must complete in less than 950 ms (the HAL's task).
+  ///
   /// # Errors
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
@@ -845,6 +825,172 @@ impl<I2C> RV3028<I2C>
     datetime.validate()?;
     let unix_timestamp = datetime.unix_timestamp() as u32;
     self.set_datetime_raw(unix_timestamp, datetime, datetime.weekday())
+  }
+
+  /// Set only the calendar seconds register (0..=59).
+  ///
+  /// Writing Seconds resets the prescaler pipeline and zeroes subseconds.
+  /// Other calendar fields and the independent Unix counter remain unchanged.
+  /// Use [Self::set_datetime_parts] to set a consistent complete date/time.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for values outside 0..=59, before any bus access.
+  /// [`Error::I2c`] for bus or mux failures. No retry or readback is performed.
+  pub fn set_seconds(&mut self, seconds: u8) -> Result<(), Error<I2C::Error>> {
+    if !(0..=59).contains(&seconds) { return Err(Error::InvalidData); }
+    self.select_mux_channel()?;
+    self.write_register_raw(REG_SECONDS, Self::bin_to_bcd(seconds))
+  }
+
+  /// Set only the calendar minutes register (0..=59).
+  ///
+  /// Seconds and subseconds are not reset.
+  /// Other calendar fields and the independent Unix counter remain unchanged.
+  /// Use [Self::set_datetime_parts] to set a consistent complete date/time.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for values outside 0..=59, before any bus access.
+  /// [`Error::I2c`] for bus or mux failures. No retry or readback is performed.
+  pub fn set_minutes(&mut self, minutes: u8) -> Result<(), Error<I2C::Error>> {
+    if !(0..=59).contains(&minutes) { return Err(Error::InvalidData); }
+    self.select_mux_channel()?;
+    self.write_register_raw(REG_MINUTES, Self::bin_to_bcd(minutes))
+  }
+
+  /// Set only the calendar weekday register (0..=6).
+  ///
+  /// Uses Monday=0 through Sunday=6. No date/weekday consistency check is made.
+  /// Other calendar fields and the independent Unix counter remain unchanged.
+  /// Use [Self::set_datetime_parts] to set a consistent complete date/time.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for values outside 0..=6, before any bus access.
+  /// [`Error::I2c`] for bus or mux failures. No retry or readback is performed.
+  pub fn set_weekday(&mut self, weekday: u8) -> Result<(), Error<I2C::Error>> {
+    if !(0..=6).contains(&weekday) { return Err(Error::InvalidData); }
+    self.select_mux_channel()?;
+    self.write_register_raw(REG_WEEKDAY, weekday)
+  }
+
+  /// Set only the calendar day register (1..=31).
+  ///
+  /// The existing month/year are not read; the resulting date may be invalid.
+  /// Other calendar fields and the independent Unix counter remain unchanged.
+  /// Use [Self::set_datetime_parts] to set a consistent complete date/time.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for values outside 1..=31, before any bus access.
+  /// [`Error::I2c`] for bus or mux failures. No retry or readback is performed.
+  pub fn set_day(&mut self, day: u8) -> Result<(), Error<I2C::Error>> {
+    if !(1..=31).contains(&day) { return Err(Error::InvalidData); }
+    self.select_mux_channel()?;
+    self.write_register_raw(REG_DATE, Self::bin_to_bcd(day))
+  }
+
+  /// Set only the calendar month register (1..=12).
+  ///
+  /// The existing day/year are not read; the resulting date may be invalid.
+  /// Other calendar fields and the independent Unix counter remain unchanged.
+  /// Use [Self::set_datetime_parts] to set a consistent complete date/time.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for values outside 1..=12, before any bus access.
+  /// [`Error::I2c`] for bus or mux failures. No retry or readback is performed.
+  pub fn set_month(&mut self, month: u8) -> Result<(), Error<I2C::Error>> {
+    if !(1..=12).contains(&month) { return Err(Error::InvalidData); }
+    self.select_mux_channel()?;
+    self.write_register_raw(REG_MONTH, Self::bin_to_bcd(month))
+  }
+
+  /// Set only the calendar year register (2000..=2099).
+  ///
+  /// The existing day/month are not read; the resulting date may be invalid.
+  /// Other calendar fields and the independent Unix counter remain unchanged.
+  /// Use [Self::set_datetime_parts] to set a consistent complete date/time.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for values outside 2000..=2099, before any bus access.
+  /// [`Error::I2c`] for bus or mux failures. No retry or readback is performed.
+  pub fn set_year(&mut self, year: i32) -> Result<(), Error<I2C::Error>> {
+    if !(2000..=2099).contains(&year) { return Err(Error::InvalidData); }
+    self.select_mux_channel()?;
+    self.write_register_raw(REG_YEAR, Self::bin_to_bcd((year - 2000) as u8))
+  }
+
+  /// Set only the calendar Hours register, accepting hours 0–23.
+  ///
+  /// Reads Control 2 and encodes the hour using the existing 12-/24-hour mode.
+  /// Callers must exclude concurrent hour-mode changes between these accesses.
+  /// Other calendar fields, subseconds and the independent Unix counter remain
+  /// unchanged. Use [Self::set_datetime_parts] for a complete date/time update.
+  ///
+  /// # Errors
+  /// [`Error::InvalidData`] for hours above 23, before any bus access.
+  /// [`Error::I2c`] for bus or mux failures. No retry or readback is performed.
+  pub fn set_hours(&mut self, hours: u8) -> Result<(), Error<I2C::Error>> {
+    if hours > 23 { return Err(Error::InvalidData); }
+    self.select_mux_channel()?;
+    let control2 = self.read_register_raw(REG_CONTROL2)?;
+    self.write_register_raw(REG_HOURS, Self::encode_calendar_hour(hours, control2))
+  }
+
+  // Input is a validated hour in 0..=23.
+  fn encode_calendar_hour(hour: u8, control2: u8) -> u8 {
+    if control2 & 0b0000_0010 != 0 {
+      let hour12 = match hour % 12 { 0 => 12, hour => hour };
+      Self::bin_to_bcd(hour12) | if hour >= 12 { 0b0010_0000 } else { 0 }
+    } else {
+      Self::bin_to_bcd(hour)
+    }
+  }
+
+  // Calendar hour encoding: Control 2 bit 1 selects 12 h; Hours bit 5 is PM.
+  fn calendar_hour(raw: u8, control2: u8) -> Result<u8, Error<I2C::Error>> {
+    if control2 & 0b0000_0010 != 0 {
+      if raw & 0b1100_0000 != 0 { return Err(Error::InvalidData); }
+      let hour12 = Self::checked_bcd(raw & 0b0001_1111)?;
+      if !(1..=12).contains(&hour12) { return Err(Error::InvalidData); }
+      Ok(hour12 % 12 + if raw & 0b0010_0000 != 0 { 12 } else { 0 })
+    } else {
+      let hour = Self::checked_bcd(raw)?;
+      if hour > 23 { return Err(Error::InvalidData); }
+      Ok(hour)
+    }
+  }
+
+  /// Read the complete calendar in one burst from registers 0x00 through 0x06.
+  ///
+  /// Control 2 is read first to determine 12-/24-hour encoding. Returned hours
+  /// are always 0–23. BCD, date, time and the Monday=0 weekday are validated.
+  /// This reads the calendar, unlike backend `datetime()` methods which read
+  /// the independent Unix counter. PORF is not checked or cleared.
+  ///
+  /// The calendar's single transfer must finish in less than 950 ms to use the
+  /// chip's register blocking (Application Manual rev. 1.4, section 4.5).
+  /// The HAL owns transaction timeouts. Control 2 and the calendar are separate
+  /// accesses: callers must exclude concurrent changes of the hour mode.
+  ///
+  /// # Errors
+  /// Returns [`Error::InvalidData`] for invalid calendar fields or a mismatched
+  /// weekday, and [`Error::I2c`] for bus or mux failures. No retry is performed.
+  pub fn get_datetime_parts(&mut self) -> Result<DateTimeParts, Error<I2C::Error>> {
+    self.select_mux_channel()?;
+    let control2 = self.read_register_raw(REG_CONTROL2)?;
+    let mut bytes = [0; 7];
+    self.read_multi_registers_raw(REG_SECONDS, &mut bytes)?;
+    let hour = Self::calendar_hour(bytes[2], control2)?;
+    let datetime = DateTimeParts {
+      year: 2000 + i32::from(Self::checked_bcd(bytes[6])?),
+      month: Self::checked_bcd(bytes[5])?,
+      day: Self::checked_bcd(bytes[4])?,
+      hour,
+      minute: Self::checked_bcd(bytes[1])?,
+      second: Self::checked_bcd(bytes[0])?,
+    };
+    datetime.validate()?;
+    let weekday = bytes[(REG_WEEKDAY - REG_SECONDS) as usize];
+    if weekday != datetime.weekday() { return Err(Error::InvalidData); }
+    Ok(datetime)
   }
 
   /// Get the year, month, day from the internal BCD registers
@@ -866,7 +1012,9 @@ impl<I2C> RV3028<I2C>
     Ok((year, month, day))
   }
 
-  /// Get the hour, minute, second from the internal BCD registers
+  /// Get hour, minute, second in one burst from the internal BCD registers.
+  /// Uses the current 12-/24-hour mode and always returns hours 0–23.
+  /// Use [Self::get_datetime_parts] for a coherent snapshot including the date.
   ///
   /// # Errors
   ///
@@ -876,10 +1024,12 @@ impl<I2C> RV3028<I2C>
   /// time outside 00:00:00–23:59:59.
   pub fn get_hms(&mut self) -> Result<(u8, u8, u8), Error<I2C::Error>> {
     let mut read_buf = [0u8;3];
-    self.read_multi_registers(REG_SECONDS, &mut read_buf)?;
+    self.select_mux_channel()?;
+    let control2 = self.read_register_raw(REG_CONTROL2)?;
+    self.read_multi_registers_raw(REG_SECONDS, &mut read_buf)?;
     let seconds = Self::checked_bcd(read_buf[0])?;
     let minutes = Self::checked_bcd(read_buf[1])?;
-    let hours = Self::checked_bcd(read_buf[2])?;
+    let hours = Self::calendar_hour(read_buf[2], control2)?;
     if hours > 23 || minutes > 59 || seconds > 59 {
       return Err(Error::InvalidData);
     }
@@ -1862,12 +2012,11 @@ mod tests {
   fn test_set_datetime_parts() {
     let unix_bytes = TEST_UNIX_TIME.to_le_bytes();
     let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write(RV3028_ADDRESS, vec![
         REG_UNIX_TIME_0, unix_bytes[0], unix_bytes[1], unix_bytes[2], unix_bytes[3]]),
-      // weekday (Friday = 4), day, month, year
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_WEEKDAY, 0x04, 0x15, 0x03, 0x24]),
-      // seconds, minutes, hours
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_SECONDS, 0x30, 0x45, 0x13]),
+      // One coherent calendar burst: seconds through year.
+      I2cTrans::write(RV3028_ADDRESS, vec![REG_SECONDS, 0x30, 0x45, 0x13, 0x04, 0x15, 0x03, 0x24]),
     ];
     let mut rv3028 = RV3028::new(I2cMock::new(&expectations));
     rv3028.set_datetime_parts(&TEST_PARTS).unwrap();
@@ -2117,3 +2266,6 @@ mod tests {
 
 #[cfg(test)]
 mod status_tests;
+
+#[cfg(test)]
+mod calendar_tests;
