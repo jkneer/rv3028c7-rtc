@@ -85,9 +85,9 @@ pub trait JiffDateTimeAccess {
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
   ///
-  /// [`Error::InvalidData`] if a nonzero event count accompanies invalid
-  /// BCD or an invalid calendar date/time. Timestamp fields are ignored
-  /// when the event count is zero.
+  /// [`Error::InvalidData`] for malformed nonempty timestamp data. The all-zero
+  /// reset block returns None; a valid timestamp with zero count is retained
+  /// after counter wraparound. Hours are normalized to 0–23.
   fn get_event_count_and_datetime(&mut self) -> Result<(u32, Option<civil::DateTime>), Self::Error>;
 }
 
@@ -290,8 +290,10 @@ mod tests {
   fn test_get_event_count_and_datetime() {
     let expectations = [
       // count, seconds, minutes, hours, date, month, year
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_COUNT_EVENTS_TS],
                            vec![3, 0x30, 0x45, 0x13, 0x15, 0x03, 0x24]),
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_COUNT_EVENTS_TS],
                            vec![0, 0, 0, 0, 0, 0, 0]),
     ];

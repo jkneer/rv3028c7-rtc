@@ -61,6 +61,21 @@ pub use jiff;
 #[cfg(feature = "jiff")]
 pub use jiff_impl::JiffDateTimeAccess;
 
+mod registers;
+pub use registers::{REGISTER_COUNT, StatusFlags, StatusSnapshot};
+#[cfg(test)]
+mod register_tests;
+
+mod timestamp;
+pub use timestamp::{TimestampCapture, TimestampConfig, TimestampSnapshot, TimestampSource};
+#[cfg(test)]
+mod timestamp_tests;
+
+mod configuration;
+#[cfg(test)]
+mod configuration_tests;
+pub use configuration::{BackupConfig, BackupSwitchoverMode, ClkoutConfig, ClkoutSource};
+
 mod eeprom;
 pub use eeprom::{
   EepromError, EepromErrorKind, USER_EEPROM_LEN,
@@ -270,12 +285,8 @@ enum RegEventControlBits {
   EventHighLowBit = 1 << 6,
   // ET bits / Event Filtering Time
   EventFilteringTimeBits = 0b11 << 4,
-  // TSR bit
-  TimeStampResetBit = 1 << 2,
   // TSOW bit
   TimeStampOverwriteBit = 1 << 1,
-  // TSS / Time Stamp Source bit
-  TimeStampSourceBit = 1 << 0,
 }
 
 /// Event log source is external interrupt EVI (default)
@@ -316,21 +327,17 @@ enum RegControl2Bits {
 // EEPROM_MIRROR_ADDRESS / EEPROM mirror register bits:
 #[repr(u8)]
 enum RegEepromMirrorBits {
-  // CLKOE / CLKOUT Enable bit -- if 1 (default) then normal clock output
-  ClockoutOutputEnableBit = 1 << 7,
   // BCIE / Backup Switchover Interrupt Enable bit bit
   BackupSwitchIntEnableBit = 1 << 6,
   // TCE bit
   TrickleChargeEnableBit = 1 << 5,
-  // BackupSwitchoverLsm = 0b11 << 2,
-  // Backup Switchover Mode / BSM bits as DSM
-  BackupSwitchoverDsm = 0b01 << 2,
   TrickleChargeResistanceBits = 0b11, // TCR bits
 }
 
 /// Current limiting resistor for trickle charging the backup supply,
 /// see [`RV3028::toggle_trickle_charge`]. A higher resistance means less charging current.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TrickleChargeCurrentLimiter {
   /// 3 kΩ (factory default)
   Ohms3k = 0b00,
@@ -513,11 +520,6 @@ impl<I2C> RV3028<I2C>
   fn write_register_raw(&mut self, reg: u8, data: u8) -> Result<(), Error<I2C::Error>> {
     self.i2c.write(RV3028_ADDRESS, &[reg, data]).map_err(Error::I2c)
   }
-
-  // fn read_register(&mut self, reg: u8) -> Result<u8, Error<I2C::Error>> {
-  //   self.select_mux_channel()?;
-  //   self.read_register_raw(reg)
-  // }
 
   fn read_register_raw(&mut self, reg: u8) -> Result<u8, Error<I2C::Error>> {
     let mut buf = [0];
@@ -737,19 +739,22 @@ impl<I2C> RV3028<I2C>
   /// Toggle whether the Vbackup power source should be used
   /// when Vdd supply level drops below useful level.
   /// - `enable` enables switching to Vbackup, disables if false
-  /// Returns the set value
+  /// Selects DSM when enabled and BSM=00 when disabled; replaces the whole BSM
+  /// field without changing calibration or charger settings. Use
+  /// [Self::set_backup_config] for explicit DSM/LSM selection. Edits only RAM;
+  /// refresh can replace it. Returns whether readback reports DSM or LSM.
   ///
   /// # Errors
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
   pub fn toggle_backup_switchover(&mut self, enable: bool) -> Result<bool, Error<I2C::Error>> {
     self.select_mux_channel()?;
-    self.set_or_clear_reg_bits_raw(
-      EEPROM_MIRROR_ADDRESS, RegEepromMirrorBits::BackupSwitchoverDsm as u8, enable)?;
-    let conf_val =
-      0 != self.read_register_raw(
-        EEPROM_MIRROR_ADDRESS)? & RegEepromMirrorBits::BackupSwitchoverDsm as u8;
-    Ok(conf_val)
+    let current = self.read_register_raw(EEPROM_MIRROR_ADDRESS)?;
+    // Replace both BSM bits, so enabling always selects DSM, even from BSM=10.
+    let target = (current & !0b0000_1100) | if enable { 0b0000_0100 } else { 0 };
+    self.write_register_raw(EEPROM_MIRROR_ADDRESS, target)?;
+    let mode = self.read_register_raw(EEPROM_MIRROR_ADDRESS)? & 0b0000_1100;
+    Ok(mode == 0b0000_0100 || mode == 0b0000_1100)
   }
 
   /// Disable all clock outputs triggered by interrupts
@@ -1248,35 +1253,12 @@ impl<I2C> RV3028<I2C>
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
   ///
-  /// [`Error::InvalidData`] if a nonzero event count accompanies invalid
-  /// BCD or an invalid calendar date/time. Timestamp fields are ignored
-  /// when the event count is zero.
+  /// [`Error::InvalidData`] for malformed BCD/date/time. Zero count with a valid
+  /// timestamp is retained after counter wraparound; only an entirely empty
+  /// register block returns None. Hour decoding follows [Self::get_timestamp].
   pub fn get_event_count_and_parts(&mut self) -> Result<(u32, Option<DateTimeParts>), Error<I2C::Error>> {
-    // Read the seven raw Time Stamp Function registers in one go
-    let mut read_buf:[u8;7] = [0u8;7];
-    self.read_multi_registers(REG_COUNT_EVENTS_TS, &mut read_buf)?;
-
-    // Convert BCD values to binary
-    let count = read_buf[0]; // Count is already in binary
-
-    let odt = {
-      if count > 0 {
-        Some(DateTimeParts {
-          second: Self::checked_bcd(read_buf[1])?,
-          minute: Self::checked_bcd(read_buf[2])?,
-          hour: Self::checked_bcd(read_buf[3])?,
-          day: Self::checked_bcd(read_buf[4])?,
-          month: Self::checked_bcd(read_buf[5])?,
-          year: Self::checked_bcd(read_buf[6])? as i32 + 2000,
-        })
-      }
-      else {
-        None
-      }
-    };
-
-    if let Some(dt) = odt { dt.validate()?; }
-    Ok((count as u32, odt))
+    let snapshot = self.get_timestamp()?;
+    Ok((u32::from(snapshot.count), snapshot.datetime))
   }
 
   /// Check the alarm status, and if it's triggered, clear it
@@ -1416,16 +1398,16 @@ impl<I2C> RV3028<I2C>
   }
 
 
-  /// Enables or disables default CLKOUT behavior
+  /// Set CLKOE in the CLKOUT RAM mirror 0x35 (EEPROM is unchanged).
+  /// CLKF can still enable output when CLKOE is clear. Use
+  /// [Self::set_clkout_config] with [ClkoutSource::ForcedLow] to force LOW.
   ///
   /// # Errors
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
   pub fn toggle_plain_clockout(&mut self, enable: bool) -> Result<(), Error<I2C::Error>> {
     self.select_mux_channel()?;
-    // TODO self.clear_reg_bits_raw(REG_STATUS, RegStatusBits::ClockIntFlagBit as u8)?;
-    self.set_or_clear_reg_bits_raw(
-      EEPROM_MIRROR_ADDRESS, RegEepromMirrorBits::ClockoutOutputEnableBit as u8, enable)
+    self.set_or_clear_reg_bits_raw(configuration::CLKOUT_REGISTER, 0b1000_0000, enable)
   }
 
   /// Enables or disables interrupt-controlled CLKOUT
@@ -1710,55 +1692,22 @@ impl<I2C> EventTimeStampLogger for  RV3028<I2C>
   }
 
   fn reset_timestamp_log(&mut self) -> Result<(), Self::Error> {
-    self.select_mux_channel()?;
-    self.set_reg_bits_raw(
-      REG_EVENT_CONTROL, RegEventControlBits::TimeStampResetBit as u8)
-
+    self.reset_timestamp()
   }
 
   fn config_timestamp_logging(
     &mut self, evt_source: u8, overwrite: bool,  start:bool) -> Result<(), Self::Error>
   {
-    self.select_mux_channel()?;
-
-    // Pause listening for events
-    // 1. Initialize bits TSE to 0.
-    self.clear_reg_bits_raw(REG_CONTROL2,
-                            RegControl2Bits::TimeStampEnableBit as u8)?;
-
-    // 2. Clear EVF and BSF
-    self.clear_reg_bits_raw(
-      REG_STATUS, RegStatusBits::EventFlagBit as u8 | RegStatusBits::BackupSwitchFlag as u8)?;
-
-    // 3. Set TSS bit to
-    // External Event Interrupt function (TSS = 0) or the
-    // Automatic Backup Switchover Interrupt function (TSS = 1)
-    // as time stamp source and initialize the appropriate function
-    let enable_bsf = evt_source == TS_EVENT_SOURCE_BSF;
-    self.set_or_clear_reg_bits_raw(
-      REG_EVENT_CONTROL, RegEventControlBits::TimeStampSourceBit as u8, enable_bsf)?;
-
-    // 6. Set TSOW bit to 1 if the last occurred event has to be recorded and TS registers are overwritten.
-    self.set_or_clear_reg_bits_raw(
-      REG_EVENT_CONTROL, RegEventControlBits::TimeStampOverwriteBit as u8, overwrite)?;
-
-    // 7. Write 1 to TSR bit, to clear all Time Stamp registers to 0x00
-    self.set_reg_bits_raw(
-      REG_EVENT_CONTROL, RegEventControlBits::TimeStampResetBit as u8)?;
-
-    // 9. Set TSE bit to 1 if you want to enable the Time Stamp function.
-    // see also: toggle_timestamp_logging
-    self.set_or_clear_reg_bits_raw(
-      REG_CONTROL2, RegControl2Bits::TimeStampEnableBit as u8, start)?;
-
-    // 1. Initialize bits TSE and EIE to 0.
-    // 2. Clear flag EVF and BSF to 0.
-    // 3. Set TSS bit to 0 to select External Event on EVI pin as Time Stamp and Interrupt source.
-    // 6. Set TSOW bit to 1 to record the last occurred event (and TS registers are overwritten).
-    // 7. Write 1 to TSR bit, to reset all Time Stamp registers to 00h. Bit TSR always returns 0 when read.
-    // 9. Set TSE bit to 1 if you want to enable the Time Stamp function.
-    // pin.
-    Ok(())
+    let source = match evt_source {
+      TS_EVENT_SOURCE_EVI => TimestampSource::ExternalEvent,
+      TS_EVENT_SOURCE_BSF => TimestampSource::BackupSwitchover,
+      _ => return Err(Error::InvalidData),
+    };
+    self.configure_timestamp(&TimestampConfig {
+      source,
+      capture: if overwrite { TimestampCapture::LastEvent } else { TimestampCapture::FirstEvent },
+      enabled: start,
+    })
   }
 
   fn toggle_time_stamp_overwrite(&mut self, enable: bool) -> Result<(), Self::Error> {
@@ -1767,9 +1716,14 @@ impl<I2C> EventTimeStampLogger for  RV3028<I2C>
   }
 
   fn set_event_timestamp_source(&mut self, source: u8) -> Result<(), Self::Error> {
-    let enable = TS_EVENT_SOURCE_BSF == source;
-    self.set_or_clear_reg_bits(
-      REG_EVENT_CONTROL, RegEventControlBits::TimeStampSourceBit as u8, enable)
+    let enable = match source {
+      TS_EVENT_SOURCE_EVI => false,
+      TS_EVENT_SOURCE_BSF => true,
+      _ => return Err(Error::InvalidData),
+    };
+    let mut config = self.get_timestamp_config()?;
+    config.source = if enable { TimestampSource::BackupSwitchover } else { TimestampSource::ExternalEvent };
+    self.set_timestamp_config(&config)
   }
 
 }
@@ -2062,6 +2016,7 @@ mod tests {
   fn test_get_event_count_and_parts() {
     let expectations = [
       // count, seconds, minutes, hours, date, month, year
+      I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_COUNT_EVENTS_TS],
                            vec![3, 0x30, 0x45, 0x13, 0x15, 0x03, 0x24]),
     ];
@@ -2126,7 +2081,10 @@ mod tests {
     // Invalid BCD which would otherwise decode to a valid 10 seconds,
     // and a correctly encoded but impossible February 30.
     for bytes in [vec![1, 0x0A, 0, 0, 1, 1, 0x24], vec![1, 0, 0, 0, 0x30, 2, 0x24]] {
-      let expectations = [I2cTrans::write_read(RV3028_ADDRESS, vec![REG_COUNT_EVENTS_TS], bytes)];
+      let expectations = [
+        I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
+        I2cTrans::write_read(RV3028_ADDRESS, vec![REG_COUNT_EVENTS_TS], bytes),
+      ];
       let mut rtc = RV3028::new(I2cMock::new(&expectations));
       assert_eq!(rtc.get_event_count_and_parts(), Err(Error::InvalidData));
       rtc.i2c.done();

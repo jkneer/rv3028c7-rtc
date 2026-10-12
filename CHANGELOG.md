@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.1] - Unreleased
 
 ### Added
+- Read-only `get_status()` with `StatusSnapshot` and decoded `StatusFlags`, plus
+  `read_register` / `read_registers` for the raw 0x00–0x3F register map.
+  Burst reads validate ranges before I/O, support no-op empty slices and never
+  acknowledge flags or issue EEPROM commands. Reserved values remain unspecified.
+- Typed timestamp source/capture/configuration and `TimestampSnapshot`, with
+  separate settings update, explicit restart, log reset and read-only readout.
+  Restart follows the vendor sequence, preserves EVI filtering and unrelated
+  flags, and leaves EIE disabled. Compatibility methods share these implementations.
+- Typed `BackupConfig`, `BackupSwitchoverMode`, `ClkoutConfig` and `ClkoutSource`,
+  with active RAM-mirror getters/setters and pure register encoding/decoding.
+  Backup updates preserve the EEOffset calibration bit; CLKOUT encoding clears
+  unimplemented bits. EEPROM persistence remains explicit and separate.
 - `read_user_ram(offset, &mut bytes)` and `write_user_ram(offset, &bytes)` for
   single-byte or two-byte accesses, with `USER_RAM_LEN = 2`. Requests are checked
   before any bus access; valid empty slices are no-ops. No alarm registers are
@@ -31,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BCD/date/time/weekday and normalizes the current 12-/24-hour encoding.
 
 ### Fixed
+- Timestamp readout normalizes 12-hour AM/PM and retains valid captured time
+  after Count TS wraps to zero. Invalid legacy timestamp sources are rejected
+  before bus access; source changes pause capture before changing TSS.
+- `toggle_plain_clockout` now addresses CLKOUT register 0x35 rather than Backup
+  register 0x37; it no longer changes the oscillator calibration bit by mistake.
+- `toggle_backup_switchover` replaces both BSM bits, selecting DSM when enabled
+  and BSM=00 when disabled, including when starting from LSM or BSM=10.
 - `get_hms()` uses the existing hour mode and normalizes 12-hour AM/PM values
   to hours 0–23, sharing the complete calendar reader's hour validation.
 - All datetime setters write seconds through year in one coherent calendar

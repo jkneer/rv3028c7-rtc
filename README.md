@@ -117,6 +117,111 @@ Control 2 and the calendar are separate accesses; exclude concurrent hour-mode
 changes. Unix counter and calendar writes are also separate: a failed operation
 can leave them inconsistent. No rollback, retry, readback or flag clearing occurs.
 
+### Backup and CLKOUT configuration
+
+`BackupConfig` describes the BSM switchover mode (Disabled, Direct or Level),
+BSIE interrupt enable, TCE charger enable, TCR series resistance and FEDE
+fast-edge detection. `get_backup_config()` reads the active RAM mirror at 0x37;
+`set_backup_config(&config)` reads it and preserves the oscillator calibration
+bit EEOffset[0] when applying the supplied settings. Disabled BSM=10 is decoded
+as Disabled and encoded as BSM=00. Keep FEDE enabled as specified by the vendor;
+charging and switchover choices belong to the application and its backup supply.
+
+`ClkoutConfig` covers register 0x35: CLKOE, CLKSY, PORIE and typed
+`ClkoutSource`. Sources include all six frequencies (32768, 8192, 1024, 64, 32
+and 1 Hz), the countdown timer interrupt and ForcedLow. CLKF can enable output
+even with CLKOE disabled; ForcedLow holds the pin LOW independently of that flag.
+Control 2 CLKIE and interrupt masks at 0x12 remain independent.
+
+```rust
+use rv3028c7_rtc::{BackupSwitchoverMode, ClkoutSource};
+
+let mut backup = rtc.get_backup_config()?;
+backup.switchover_mode = BackupSwitchoverMode::Disabled;
+backup.trickle_charge_enabled = false;
+backup.fast_edge_detection_enabled = true;
+rtc.set_backup_config(&backup)?;
+
+let mut clkout = rtc.get_clkout_config()?;
+clkout.source = ClkoutSource::ForcedLow;
+rtc.set_clkout_config(&clkout)?;
+```
+
+These setters change active RAM only: they do not persist EEPROM, alter EERD,
+acknowledge flags, wait for LSM activation or guarantee glitch-free frequency
+changes. Refresh can reload the persistent values. For persistence, use the
+existing explicit EEPROM APIs; `BackupConfig::to_register(current)` preserves
+the current calibration bit and `ClkoutConfig::to_register()` zeros unimplemented
+bits 5:4. The owner decides which changes to persist and when. Exclude
+concurrent refresh/calibration changes while updating Backup.
+
+The compatibility helper `toggle_backup_switchover(true)` selects DSM, and
+`false` selects BSM=00. Use the typed configuration to select LSM explicitly.
+`toggle_plain_clockout` now correctly changes CLKOE at 0x35.
+
+### Timestamp capture
+
+`TimestampConfig` selects `TimestampSource::ExternalEvent` or
+`BackupSwitchover`, `TimestampCapture::FirstEvent` or `LastEvent`, and TSE enable.
+Configure EVI polarity/filtering or backup switchover separately; INT and CLKOUT
+routing are independent.
+
+- `get_timestamp_config()`: read settings without changing flags or log.
+- `set_timestamp_config(&config)`: pause TSE/EIE, change source/policy, restore
+  EIE and apply TSE; preserve the log and flags. FirstEvent still depends on EVF.
+- `configure_timestamp(&config)`: explicitly restart with an empty log, following
+  the vendor sequence: TSE/EIE off, TSOW, acknowledge only EVF/BSF, pulse TSR,
+  select TSS, then TSE. EIE remains off.
+- `reset_timestamp()`: pulse TSR only; does not acknowledge EVF or re-arm the
+  FirstEvent latch.
+- `get_timestamp()`: read Control 2 and then the complete 0x14–0x1A block in
+  one burst, without flag acknowledgements or reset.
+
+`TimestampSnapshot` contains the binary event count modulo 256 and an optional
+validated `DateTimeParts`. Count zero can be wraparound; a valid calendar remains
+available then. Only the entirely zero reset block means None. Hours are normalized
+to 0–23 using the current hour mode; do not change that mode after capture.
+The chip blocks capture while reading the timestamp block. An event after that
+read may still be discarded by a subsequent explicit restart.
+
+Configuration operations can miss events while paused. Bus failures are not
+retried or rolled back; capture/interrupt state may remain changed. The driver
+does not establish the accuracy or trust of the calendar at capture time.
+Legacy event readers and backend converters delegate to the same reader, and
+legacy configuration delegates to the typed restart implementation. Unknown
+legacy source values return InvalidData before bus access.
+
+### Technical status and raw registers
+
+`get_status()` reads registers 0x0E–0x13 in one burst and returns
+`StatusSnapshot`: decoded `StatusFlags`, raw Control 1/2, GP Bits,
+Clock Interrupt Mask and Event Control. Flags expose PORF, EVF, AF, TF, UF,
+BSF, CLKF and read-only EEbusy. The read acknowledges no flags, resets no log
+and issues no EEPROM commands. It describes the registers at read time;
+calendar validity and application decisions remain the owner's responsibility.
+A burst does not make asynchronously changing registers an atomic snapshot.
+
+`read_register(address)` reads one raw register.
+`read_registers(address, &mut bytes)` reads a consecutive range in one burst.
+Both accept the physical register map 0x00–0x3F, including reserved addresses
+whose values are unspecified. Configuration addresses expose active RAM
+mirrors, rather than persistent EEPROM. Write-only registers may read as zero.
+
+```rust
+let status = rtc.get_status()?;
+let reset_seen = status.flags.power_on_reset();
+let mut calendar_raw = [0; 7];
+rtc.read_registers(0x00, &mut calendar_raw)?;
+let backup_raw = rtc.read_register(0x37)?;
+```
+
+Ranges are checked before any bus access or buffer change, with no address
+wrapping. Empty slices at starts 0x00–0x40 perform no I/O. HAL failures preserve
+the original bus error and may leave a partially received buffer. Raw reads do
+not perform BCD validation, counter stabilization or hour-mode conversion;
+use the corresponding typed methods when those guarantees are needed.
+The HAL must meet the chip's transfer deadlines for calendar/timestamp blocking.
+
 ### User RAM
 
 The RTC has two general-purpose RAM bytes at registers 0x1F and 0x20.
