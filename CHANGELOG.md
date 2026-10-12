@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Without it, the driver depends only on `embedded-hal`.
 
 ### Added
+- `read_user_ram(offset, &mut bytes)` and `write_user_ram(offset, &bytes)` for
+  single-byte or two-byte accesses, with `USER_RAM_LEN = 2`. Requests are checked
+  before any bus access; valid empty slices are no-ops. No alarm registers are
+  repurposed. Tests cover exact transfers, boundaries, mux selection and bus errors.
 - `check_and_clear_backup_event()` to check and clear the Backup Switch Flag (BSF).
 - Optional `jiff` feature with the `JiffDateTimeAccess` trait: the clock, alarm and event timestamp
   using `jiff::civil` types. The `jiff` crate is re-exported as `rv3028c7_rtc::jiff`.

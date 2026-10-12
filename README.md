@@ -82,12 +82,33 @@ let mut rtc1 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b0000_0
 let mut rtc2 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b1000_0000);
 ```
 
+### User RAM
+
+The RTC has two general-purpose RAM bytes at registers 0x1F and 0x20.
+They are retained on backup power and reset to zero on power-on reset.
+The offset is relative to this two-byte region; alarm and timer registers are
+not included.
+
+```rust
+let mut bytes = [0; 2];
+rtc.read_user_ram(0, &mut bytes)?;
+rtc.write_user_ram(0, &bytes)?;      // both bytes in one transfer
+rtc.write_user_ram(0, &bytes[..1])?; // first byte only
+bytes[1] = 0xA5;
+rtc.write_user_ram(1, &bytes[1..])?; // second byte only
+```
+
+Out-of-range requests return `Error::InvalidData` before bus access.
+Empty slices at offsets 0, 1 or 2 perform no I/O. Writes do not verify readback
+or roll back partial transfers; record validity and commit ordering belong
+to the application. Password-protected writes require the chip to be unlocked.
+
 ### Errors
 
 All fallible driver methods return `rv3028c7_rtc::Error<I2C::Error>`:
 
 - `Error::I2c(error)` preserves the underlying HAL error.
-- `Error::InvalidData` reports an invalid input or register value.
+- `Error::InvalidData` reports an invalid input/register value or an out-of-range memory access.
 - `Error::InconsistentRead` means no consecutive Unix counter reads agreed within
   four reads. The HAL remains responsible for individual transaction timeouts.
 

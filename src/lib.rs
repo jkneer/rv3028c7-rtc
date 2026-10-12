@@ -69,7 +69,7 @@ use embedded_hal::i2c::I2c;
 pub enum Error<E> {
   /// The underlying I2C transaction failed.
   I2c(E),
-  /// An input or register value is not a valid supported date, time or alarm.
+  /// An input/register value is invalid, or a memory access exceeds its range.
   InvalidData,
   /// No two consecutive Unix counter reads agreed within four reads.
   InconsistentRead,
@@ -189,6 +189,12 @@ const REG_COUNT_EVENTS_TS: u8 = 0x14; // Count TS
 // const REG_MONTH_TS: u8 = 0x19; // Month TS
 // const REG_YEAR_TS: u8 = 0x1A; // Month TS
 
+
+/// Number of general-purpose User RAM bytes at registers 0x1F and 0x20.
+/// Alarm/timer registers reused by an application are not included.
+pub const USER_RAM_LEN: usize = 2;
+// First register of the two-byte User RAM region; distinct from an offset.
+const REG_USER_RAM_START: u8 = 0x1F;
 
 // First address of "Unix Time Counter"
 const REG_UNIX_TIME_0: u8 = 0x1B;
@@ -509,6 +515,95 @@ impl<I2C> RV3028<I2C>
     Ok(buf[0])
   }
 
+
+  /// Read bytes from the two general-purpose User RAM registers.
+  ///
+  /// `offset` is a byte offset from User RAM 1: 0 selects register 0x1F,
+  /// 1 selects register 0x20. The entire buffer must fit within
+  /// [`USER_RAM_LEN`] bytes. An empty buffer at offset 0, 1 or 2 succeeds
+  /// without bus access, including mux selection.
+  ///
+  /// These bytes are retained while the chip remains powered, including from
+  /// VBACKUP, and reset to zero on power-on reset. No flags are cleared.
+  /// Alarm and timer registers are not part of this memory region.
+  /// See [Application Manual rev. 1.4, section 3.11, p. 31](https://www.microcrystal.com/fileadmin/Media/Products/RTC/App.Manual/RV-3028-C7_App-Manual.pdf#page=31).
+  ///
+  /// # Errors
+  ///
+  /// [`Error::InvalidData`] if the range does not fit, before any bus access.
+  /// [`Error::I2c`] if mux selection or reading fails. After a failed read,
+  /// the buffer may be partially modified by the HAL.
+  pub fn read_user_ram(
+    &mut self,
+    offset: u8,
+    bytes: &mut [u8],
+  ) -> Result<(), Error<I2C::Error>> {
+    Self::check_user_ram_range(offset, bytes.len())?;
+    if bytes.is_empty() {
+      return Ok(());
+    }
+    self.read_multi_registers(REG_USER_RAM_START + offset, bytes)
+  }
+
+  /// Write bytes to the two general-purpose User RAM registers.
+  ///
+  /// `offset` is a byte offset from User RAM 1: 0 selects register 0x1F,
+  /// 1 selects register 0x20. The entire slice must fit within [`USER_RAM_LEN`]
+  /// bytes. An empty slice at offset 0, 1 or 2 succeeds without bus access.
+  ///
+  /// Only the selected bytes are written; other registers are untouched.
+  /// Two bytes use one I2C write, with the first slice byte written first.
+  /// There is no readback, retry or rollback; a failed transfer may have written
+  /// part of the data. The caller owns any marker or commit ordering.
+  /// If password write protection is enabled, the chip must already be unlocked;
+  /// successful bus acknowledgment alone does not verify the stored value.
+  /// See [Application Manual rev. 1.4, section 3.11, p. 31](https://www.microcrystal.com/fileadmin/Media/Products/RTC/App.Manual/RV-3028-C7_App-Manual.pdf#page=31).
+  ///
+  /// # Examples
+  ///
+  /// ```no_run
+  /// use embedded_hal::i2c::I2c;
+  /// use rv3028c7_rtc::{Error, RV3028};
+  ///
+  /// fn update<I2C: I2c>(rtc: &mut RV3028<I2C>) -> Result<(), Error<I2C::Error>> {
+  ///     let mut bytes = [0; 2];
+  ///     rtc.read_user_ram(0, &mut bytes)?;
+  ///     rtc.write_user_ram(0, &bytes)?;      // Both bytes.
+  ///     rtc.write_user_ram(0, &bytes[..1])?; // First byte only.
+  ///     bytes[1] = 0xA5;
+  ///     rtc.write_user_ram(1, &bytes[1..])?; // Second byte only.
+  ///     Ok(())
+  /// }
+  /// ```
+  ///
+  /// # Errors
+  ///
+  /// [`Error::InvalidData`] if the range does not fit, before any bus access.
+  /// [`Error::I2c`] if mux selection or writing fails.
+  pub fn write_user_ram(
+    &mut self,
+    offset: u8,
+    bytes: &[u8],
+  ) -> Result<(), Error<I2C::Error>> {
+    Self::check_user_ram_range(offset, bytes.len())?;
+    if bytes.is_empty() {
+      return Ok(());
+    }
+    self.select_mux_channel()?;
+    let mut packet = [0; 1 + USER_RAM_LEN];
+    packet[0] = REG_USER_RAM_START + offset;
+    packet[1..1 + bytes.len()].copy_from_slice(bytes);
+    self.i2c.write(RV3028_ADDRESS, &packet[..1 + bytes.len()]).map_err(Error::I2c)
+  }
+
+  // Check before any I/O so a request cannot reach the adjacent password registers.
+  fn check_user_ram_range(offset: u8, len: usize) -> Result<(), Error<I2C::Error>> {
+    let offset = usize::from(offset);
+    if offset > USER_RAM_LEN || len > USER_RAM_LEN - offset {
+      return Err(Error::InvalidData);
+    }
+    Ok(())
+  }
 
   /// Check whether the Power On Reset flag is set.
   /// If this flag is cleared (set to zero) beforehand,
@@ -1911,4 +2006,113 @@ mod tests {
     }
   }
 
+
+  #[test]
+  fn user_ram_reads_exact_requested_register_range() {
+    for (offset, values) in [(0, vec![0xA1]), (1, vec![0xB2]), (0, vec![0xA1, 0xB2])] {
+      let expectations = [
+        I2cTrans::write_read(RV3028_ADDRESS, vec![0x1F + offset], values.clone()),
+      ];
+      let mut rtc = RV3028::new(I2cMock::new(&expectations));
+      let mut buffer = [0xCC; 2];
+      rtc.read_user_ram(offset, &mut buffer[..values.len()]).unwrap();
+      assert_eq!(&buffer[..values.len()], &values);
+      if values.len() == 1 {
+        assert_eq!(buffer[1], 0xCC);
+      }
+      rtc.i2c.done();
+    }
+  }
+
+  #[test]
+  fn user_ram_writes_exact_requested_bytes_in_one_transfer() {
+    for (offset, data, packet) in [
+      (0, vec![0xA1], vec![0x1F, 0xA1]),
+      (1, vec![0xB2], vec![0x20, 0xB2]),
+      (0, vec![0xA1, 0xB2], vec![0x1F, 0xA1, 0xB2]),
+    ] {
+      let expectations = [I2cTrans::write(RV3028_ADDRESS, packet)];
+      let mut rtc = RV3028::new(I2cMock::new(&expectations));
+      rtc.write_user_ram(offset, &data).unwrap();
+      rtc.i2c.done();
+    }
+  }
+
+  #[test]
+  fn user_ram_reuses_the_same_buffer_for_read_and_partial_write() {
+    let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![0x1F], vec![0xA1, 0xB2]),
+      I2cTrans::write(RV3028_ADDRESS, vec![0x20, 0xC3]),
+    ];
+    let mut rtc = RV3028::new(I2cMock::new(&expectations));
+    let mut bytes = [0; 2];
+    rtc.read_user_ram(0, &mut bytes).unwrap();
+    bytes[1] = 0xC3;
+    rtc.write_user_ram(1, &bytes[1..]).unwrap();
+    assert_eq!(bytes, [0xA1, 0xC3]);
+    rtc.i2c.done();
+  }
+
+  #[test]
+  fn user_ram_empty_ranges_do_not_access_bus_or_mux() {
+    let mut rtc = RV3028::new_with_mux(I2cMock::new(&[]), 0x70, 1);
+    for offset in 0..=2 {
+      rtc.read_user_ram(offset, &mut []).unwrap();
+      rtc.write_user_ram(offset, &[]).unwrap();
+    }
+    rtc.i2c.done();
+  }
+
+  #[test]
+  fn user_ram_invalid_ranges_do_not_access_bus_or_modify_buffer() {
+    let mut rtc = RV3028::new_with_mux(I2cMock::new(&[]), 0x70, 1);
+    for (offset, len) in [(0, 3), (1, 2), (2, 1), (3, 0), (u8::MAX, 0), (u8::MAX, 1)] {
+      let mut bytes = [0xA5; 3];
+      assert_eq!(rtc.read_user_ram(offset, &mut bytes[..len]), Err(Error::InvalidData));
+      assert_eq!(bytes, [0xA5; 3]);
+      assert_eq!(rtc.write_user_ram(offset, &bytes[..len]), Err(Error::InvalidData));
+    }
+    rtc.i2c.done();
+  }
+
+  #[test]
+  fn user_ram_selects_mux_before_each_nonempty_access() {
+    let expectations = [
+      I2cTrans::write(0x70, vec![4]),
+      I2cTrans::write_read(RV3028_ADDRESS, vec![0x20], vec![0xA5]),
+      I2cTrans::write(0x70, vec![4]),
+      I2cTrans::write(RV3028_ADDRESS, vec![0x1F, 0xB6]),
+    ];
+    let mut rtc = RV3028::new_with_mux(I2cMock::new(&expectations), 0x70, 4);
+    let mut byte = [0];
+    rtc.read_user_ram(1, &mut byte).unwrap();
+    assert_eq!(byte, [0xA5]);
+    rtc.write_user_ram(0, &[0xB6]).unwrap();
+    rtc.i2c.done();
+  }
+
+  #[test]
+  fn user_ram_preserves_read_write_and_mux_errors_without_retries() {
+    use embedded_hal::i2c::ErrorKind;
+    let expectations = [
+      I2cTrans::write_read(RV3028_ADDRESS, vec![0x1F], vec![0])
+        .with_error(ErrorKind::Bus),
+      I2cTrans::write(RV3028_ADDRESS, vec![0x20, 0xA5])
+        .with_error(ErrorKind::NoAcknowledge(embedded_hal::i2c::NoAcknowledgeSource::Data)),
+    ];
+    let mut rtc = RV3028::new(I2cMock::new(&expectations));
+    assert_eq!(rtc.read_user_ram(0, &mut [0]), Err(Error::I2c(ErrorKind::Bus)));
+    assert_eq!(rtc.write_user_ram(1, &[0xA5]),
+      Err(Error::I2c(ErrorKind::NoAcknowledge(embedded_hal::i2c::NoAcknowledgeSource::Data))));
+    rtc.i2c.done();
+
+    let expectations = [
+      I2cTrans::write(0x70, vec![1]).with_error(ErrorKind::ArbitrationLoss),
+      I2cTrans::write(0x70, vec![1]).with_error(ErrorKind::ArbitrationLoss),
+    ];
+    let mut rtc = RV3028::new_with_mux(I2cMock::new(&expectations), 0x70, 1);
+    assert_eq!(rtc.read_user_ram(0, &mut [0]), Err(Error::I2c(ErrorKind::ArbitrationLoss)));
+    assert_eq!(rtc.write_user_ram(0, &[0xA5]), Err(Error::I2c(ErrorKind::ArbitrationLoss)));
+    rtc.i2c.done();
+  }
 }
