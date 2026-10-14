@@ -127,8 +127,8 @@ fn every_hour_round_trips_in_12_and_24_hour_mode_without_mode_writes() {
       let unix = (1_710_510_330u32 - 13 * 3600 + hour as u32 * 3600).to_le_bytes();
       let expected = [
         T::write_read(0x52, vec![0x10], vec![mode]),
-        T::write(0x52, vec![0x1B, unix[0], unix[1], unix[2], unix[3]]),
         T::write(0x52, vec![0, 0x30, 0x45, code, 4, 0x15, 0x03, 0x24]),
+        T::write(0x52, vec![0x1B, unix[0], unix[1], unix[2], unix[3]]),
         T::write_read(0x52, vec![0x10], vec![mode]),
         T::write_read(0x52, vec![0], vec![0x30, 0x45, code, 4, 0x15, 0x03, 0x24]),
         T::write_read(0x52, vec![0x10], vec![mode]),
@@ -157,8 +157,8 @@ fn write_failures_stop_before_later_transfers_without_retry_or_status_clear() {
   let unix = 1_710_510_330u32.to_le_bytes();
   let baseline = [
     T::write_read(0x52, vec![0x10], vec![0]),
-    T::write(0x52, vec![0x1B, unix[0], unix[1], unix[2], unix[3]]),
     T::write(0x52, vec![0, 0x30, 0x45, 0x13, 4, 0x15, 0x03, 0x24]),
+    T::write(0x52, vec![0x1B, unix[0], unix[1], unix[2], unix[3]]),
   ];
   for failure in 0..3 {
     let mut expected = baseline[..=failure].to_vec();

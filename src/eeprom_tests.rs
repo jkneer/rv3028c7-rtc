@@ -28,7 +28,7 @@ fn begin(control: u8) -> Vec<T> {
   result
 }
 fn finish(expected: &mut Vec<T>, current: u8, restored: u8) {
-  expected.extend([read(0x0F, current), write(0x0F, restored)]);
+  expected.extend([read(0x0E, 0), read(0x0F, current), write(0x0F, restored)]);
 }
 fn byte_read(expected: &mut Vec<T>, address: u8, value: u8) {
   // Literal bus sequence from Application Manual 4.6.6, including idle checks.
@@ -242,19 +242,19 @@ fn busy_waits_precede_address_changes_and_completion_read() {
 }
 
 #[test]
-fn busy_timeout_is_bounded_before_and_after_commands_and_restores_eerd() {
+fn busy_timeout_is_bounded_before_and_after_commands_and_keeps_refresh_disabled() {
   for after_command in [false, true] {
     let mut expected = begin(0);
     if after_command {
       expected.extend([read(0x0E, 0), write(0x27, 0), write(0x27, 0x11)]);
     }
     expected.extend((0..201).map(|_| read(0x0E, 0x80)));
-    finish(&mut expected, 8, 0);
+    expected.push(read(0x0E, 0x80)); // no Control 1 restore while still busy
     let mut rtc = RV3028::new(Mock::new(&expected));
     let mut delay = Delay::default();
     assert_eq!(
       rtc.update_configuration_eeprom(&mut delay),
-      Err(EepromError::Operation(Failure::BusyTimeout))
+      Err(EepromError::RestoreBusy { operation: Some(Failure::BusyTimeout) })
     );
     assert_eq!(delay.calls.len(), 200 + usize::from(after_command));
     assert_eq!(
@@ -289,18 +289,19 @@ fn verification_error_reports_address_values_and_still_restores() {
 fn each_read_transaction_failure_preserves_error_and_attempts_restore() {
   let mut baseline = begin(0);
   byte_read(&mut baseline, 0, 0xAA);
+  let restore_index = baseline.len();
   finish(&mut baseline, 8, 0);
   for index in 0..baseline.len() {
     let mut expected = baseline[..=index].to_vec();
     expected[index] = expected[index].clone().with_error(ErrorKind::Bus);
-    if (1..9).contains(&index) {
+    if index > 0 && index < restore_index {
       finish(&mut expected, 8, 0);
     }
     let mut rtc = RV3028::new(Mock::new(&expected));
     let mut delay = Delay::default();
     let result = rtc.read_eeprom(0, &mut delay);
     let bus = Error::I2c(ErrorKind::Bus);
-    let error = if index >= 9 {
+    let error = if index >= restore_index {
       EepromError::Restore {
         operation: None,
         error: bus,
@@ -318,6 +319,7 @@ fn operation_and_restore_failures_are_both_retained() {
   let mut expected = begin(0);
   expected.extend([
     read(0x0E, 0).with_error(ErrorKind::Bus),
+    read(0x0E, 0),
     read(0x0F, 8).with_error(ErrorKind::ArbitrationLoss),
   ]);
   let mut rtc = RV3028::new(Mock::new(&expected));
@@ -328,6 +330,24 @@ fn operation_and_restore_failures_are_both_retained() {
       operation: Some(Failure::Driver(Error::I2c(ErrorKind::Bus))),
       error: Error::I2c(ErrorKind::ArbitrationLoss),
     })
+  );
+  rtc.i2c.done();
+}
+
+#[test]
+fn failed_idle_confirmation_during_restore_never_writes_control_and_retains_both_errors() {
+  let mut expected = begin(0);
+  expected.extend([
+    read(0x0E, 0).with_error(ErrorKind::Bus),
+    read(0x0E, 0).with_error(ErrorKind::ArbitrationLoss),
+  ]);
+  let mut rtc = RV3028::new(Mock::new(&expected));
+  assert_eq!(
+    rtc.read_eeprom(0, &mut Delay::default()),
+    Err(EepromError::Restore {
+      operation: Some(Failure::Driver(Error::I2c(ErrorKind::Bus))),
+      error: Error::I2c(ErrorKind::ArbitrationLoss),
+    }),
   );
   rtc.i2c.done();
 }

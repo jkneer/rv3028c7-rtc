@@ -128,6 +128,8 @@ mod interrupt;
 pub use interrupt::{ClkoutInterruptConfig, InterruptConfig, InterruptEnables};
 #[cfg(test)]
 mod typed_api_tests;
+#[cfg(test)]
+mod hardware_tests;
 
 mod hour_mode;
 pub use hour_mode::HourMode;
@@ -543,6 +545,11 @@ impl<I2C> RV3028<I2C>
   /// an i2c mux between the RTC and the host.
   /// - `mux_addr` : the i2c address of the mux itself
   /// - `mux_chan` : the mux channel assigned to the RTC
+  ///
+  /// If other users can change this mux's channel, serialize their driver calls
+  /// for the entire method, including EEPROM delays. Shared-bus adapters that
+  /// lock only individual I2C transactions do not protect mux selection and
+  /// the following RTC accesses together.
   pub fn new_with_mux(i2c: I2C, mux_addr: u8, mux_chan: u8) -> Self {
     RV3028 {
       i2c,
@@ -849,8 +856,9 @@ impl<I2C> RV3028<I2C>
     Ok(reg_val)
   }
 
-  // Write Unix time first, then one coherent calendar burst. Writing seconds
-  // resets the prescaler; the seven calendar registers share one I2C access.
+  // Reset the prescaler with a coherent calendar burst before writing Unix time
+  // (Application Manual 4.16.1). The caller must complete both within 950 ms
+  // of writing Seconds, including any scheduling delay between transfers.
   fn set_datetime_raw(&mut self, unix_timestamp: u32, dt: &DateTimeParts, weekday: u8) -> Result<(), Error<I2C::Error>> {
     self.select_mux_channel()?;
     let control2 = self.read_register_raw(REG_CONTROL2)?;
@@ -865,8 +873,8 @@ impl<I2C> RV3028<I2C>
       Self::bin_to_bcd(dt.month),
       Self::bin_to_bcd((dt.year - 2000) as u8),
     ];
-    self.set_unix_time_raw(unix_timestamp)?;
-    self.i2c.write(RV3028_ADDRESS, &packet).map_err(Error::I2c)
+    self.i2c.write(RV3028_ADDRESS, &packet).map_err(Error::I2c)?;
+    self.set_unix_time_raw(unix_timestamp)
   }
 
   /// Set the date and time: both the unix time counter and all internal BCD date and time
@@ -880,10 +888,13 @@ impl<I2C> RV3028<I2C>
   /// This assists with clock synchronization with external clocks.
   ///
   /// Uses the existing 12-/24-hour setting without changing Control 2 or alarms.
-  /// Unix time is written first, then all seven calendar bytes in one burst.
+  /// All seven calendar bytes are written in one burst, resetting the prescaler
+  /// through Seconds, then Unix time is written (Application Manual 4.16.1).
   /// These transfers are not atomic together: a bus/power failure may leave
   /// counter and calendar inconsistent. No readback or flag clearing is done.
-  /// The calendar transfer must complete in less than 950 ms (the HAL's task).
+  /// The calendar transfer must complete in less than 950 ms. From writing
+  /// Seconds to the Unix write's STOP must also take less than 950 ms, including
+  /// delays between transfers. The caller/HAL must enforce this timing.
   ///
   /// # Errors
   ///
@@ -1350,6 +1361,12 @@ impl<I2C> RV3028<I2C>
   /// Hours are 0–23, encoded according to the current 12-/24-hour mode.
   /// All fields, including disabled fields, must be valid; checked before bus access.
   ///
+  /// Pauses AIE before changing WADA or alarm fields and restores its original
+  /// state after acknowledging AF. Other Control 2 bits and CLKF are preserved;
+  /// RESET is never issued. Exclude concurrent mode/alarm/control changes.
+  /// Bus errors stop without rollback and may leave AIE disabled or the alarm
+  /// partly configured. Acknowledged AF cannot be recovered.
+  ///
   /// # Errors
   ///
   /// [`Error::I2c`] if an I2C transaction fails, including mux selection.
@@ -1362,7 +1379,11 @@ impl<I2C> RV3028<I2C>
     alarm.validate()?;
     self.select_mux_channel()?;
     let control2 = self.read_register_raw(REG_CONTROL2)?;
-    // Initialize AF to 0; AIE/AlarmIntEnableBit is managed independently
+    let alarm_enabled = control2 & RegControl2Bits::AlarmIntEnableBit as u8 != 0;
+    if alarm_enabled {
+      self.write_register_raw(REG_CONTROL2, control2 & !0b0000_1001)?;
+    }
+    // AIE is off while the comparator can see a partial alarm configuration.
     self.clear_reg_bits_raw(REG_STATUS, RegStatusBits::AlarmFlagBit as u8)?;
 
     // Procedure suggested by App Notes:
@@ -1395,6 +1416,9 @@ impl<I2C> RV3028<I2C>
 
     // Clear AF again in case the above setting process immediately triggered the alarm
     self.clear_reg_bits_raw(REG_STATUS, RegStatusBits::AlarmFlagBit as u8)?;
+    if alarm_enabled {
+      self.write_register_raw(REG_CONTROL2, control2 & !0b0000_0001)?;
+    }
 
     Ok(())
   }
@@ -1829,10 +1853,10 @@ mod tests {
     let unix_bytes = TEST_UNIX_TIME.to_le_bytes();
     let expectations = [
       I2cTrans::write_read(RV3028_ADDRESS, vec![REG_CONTROL2], vec![0]),
+      // One coherent calendar burst resets the prescaler before Unix time.
+      I2cTrans::write(RV3028_ADDRESS, vec![REG_SECONDS, 0x30, 0x45, 0x13, 0x04, 0x15, 0x03, 0x24]),
       I2cTrans::write(RV3028_ADDRESS, vec![
         REG_UNIX_TIME_0, unix_bytes[0], unix_bytes[1], unix_bytes[2], unix_bytes[3]]),
-      // One coherent calendar burst: seconds through year.
-      I2cTrans::write(RV3028_ADDRESS, vec![REG_SECONDS, 0x30, 0x45, 0x13, 0x04, 0x15, 0x03, 0x24]),
     ];
     let mut rv3028 = RV3028::new(I2cMock::new(&expectations));
     rv3028.set_datetime_parts(&TEST_PARTS).unwrap();

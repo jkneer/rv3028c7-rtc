@@ -51,18 +51,31 @@ pub enum EepromErrorKind<E> {
 
 /// EEPROM failure, including a possible failure to restore automatic refresh.
 ///
-/// After a restore failure, the EERD state is unknown. After a timeout or bus
-/// error, an EEPROM command may still be in progress. No automatic retry or
-/// rollback is performed.
+/// Before restoring automatic refresh, EEbusy must be confirmed clear. If it
+/// remains set, restoration is skipped and [`Self::RestoreBusy`] is returned.
+/// After a restore bus failure, the EERD state is unknown. An EEPROM command
+/// may still be in progress after a timeout or bus error. No automatic retry
+/// or rollback is performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EepromError<E> {
   /// Operation failed; restoration succeeded or no change was needed.
   Operation(EepromErrorKind<E>),
+  /// Auto-refresh restoration was skipped because EEbusy is still set.
+  ///
+  /// EERD is left untouched. It normally remains 1; if the initial write to
+  /// disable refresh failed, its state is unknown. Keep refresh disabled until
+  /// EEbusy is confirmed clear, then restore it explicitly through register
+  /// access, preserving the other Control 1 bits. No command should be retried
+  /// until its completion and stored data have been inspected.
+  RestoreBusy {
+    /// Original failure, or None if the operation succeeded.
+    operation: Option<EepromErrorKind<E>>,
+  },
   /// Restoration failed, possibly in addition to the operation itself.
   Restore {
     /// Original failure, or None if the operation succeeded.
     operation: Option<EepromErrorKind<E>>,
-    /// Failure while reading/modifying Control 1 to restore EERD.
+    /// Failure while confirming idle or reading/modifying Control 1.
     error: Error<E>,
   },
 }
@@ -71,6 +84,10 @@ impl<E: fmt::Debug> fmt::Display for EepromError<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::Operation(error) => write!(f, "EEPROM operation failed: {error:?}"),
+      Self::RestoreBusy { operation } => write!(
+        f,
+        "EEPROM refresh restoration skipped while busy; operation: {operation:?}"
+      ),
       Self::Restore { operation, error } => write!(
         f,
         "EEPROM refresh restoration failed: {error}; operation: {operation:?}"
@@ -94,8 +111,9 @@ impl<I2C: I2c> RV3028<I2C> {
   ///
   /// Uses the command protocol documented in the
   /// [Application Manual](https://www.microcrystal.com/fileadmin/Media/Products/RTC/App.Manual/RV-3028-C7_App-Manual.pdf),
-  /// sections 4.6.6–4.6.8. EERD is restored to its original state, including
-  /// when an operation fails; restoration failures are reported separately.
+  /// sections 4.6.6–4.6.8. EERD is restored to its original state only after
+  /// confirming EEbusy=0, including after an operation failure. Busy or bus
+  /// failures during restoration are reported separately by [`EepromError`].
   ///
   /// # Errors
   /// Returns an invalid-range, bus, busy-timeout or refresh-restoration error.
@@ -275,7 +293,8 @@ impl<I2C: I2c> RV3028<I2C> {
   ///
   /// This replaces active settings, including unpersisted changes. The chip
   /// applies the settings as the mirrors are loaded. EERD's original state
-  /// is restored afterwards; no readback verification is performed.
+  /// is restored afterwards only after confirming EEbusy=0; no readback
+  /// verification is performed. See [`EepromError`] for restoration failures.
   ///
   /// # Errors
   /// Returns a bus, busy-timeout or restoration error.
@@ -312,7 +331,8 @@ impl<I2C: I2c> RV3028<I2C> {
     let original = self
       .read_register_raw(REG_CONTROL1)
       .map_err(|e| EepromError::Operation(Failure::Driver(e)))?;
-    // Even a failed I2C write may have reached the chip; restore afterwards.
+    // Even a failed I2C write may have reached the chip; inspect idle before
+    // any attempt to restore automatic refresh afterwards.
     let result = if original & EERD == 0 {
       self
         .write_register_raw(REG_CONTROL1, original | EERD)
@@ -322,6 +342,17 @@ impl<I2C: I2c> RV3028<I2C> {
       body(self, delay)
     };
     let restored = if original & EERD == 0 {
+      // A failed command/poll may leave an EEPROM cycle in progress. Never
+      // enable automatic refresh until completion is positively confirmed.
+      match self.read_register_raw(REG_STATUS) {
+        Ok(status) if status & EEBUSY != 0 => {
+          return Err(EepromError::RestoreBusy { operation: result.err() });
+        }
+        Err(error) => {
+          return Err(EepromError::Restore { operation: result.err(), error });
+        }
+        Ok(_) => {}
+      }
       // Preserve other Control 1 bits, including timer changes during waits.
       self
         .read_register_raw(REG_CONTROL1)

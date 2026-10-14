@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `write_configuration_eeprom`, `update_configuration_eeprom` and
   `refresh_configuration` for configuration mirrors and persistent settings.
 - EEPROM protocol with caller-provided `embedded-hal::delay::DelayNs`, mandatory
-  settling delays, bounded busy polling, preservation of the original EERD state,
+  settling delays, bounded busy polling, restoration of EERD after confirmed idle,
   and `EepromError` / `EepromErrorKind` retaining operation and restoration failures.
   Existing non-EEPROM error types are unchanged.
 - Individual calendar field setters: `set_seconds`, `set_minutes`, `set_hours`,
@@ -58,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BCD/date/time/weekday and normalizes the current 12-/24-hour encoding.
 
 ### Fixed
+- Datetime setters reset the prescaler with the calendar burst before writing
+  Unix time, preventing a one-second offset from the old prescaler phase.
+  Both transfers must finish within 950 ms of writing Seconds.
+- Alarm setters pause AIE while changing WADA and alarm fields, then restore
+  its original state after clearing AF. Partial matches cannot trigger INT or
+  latch a new CLKF during reconfiguration; bus failures may leave AIE disabled.
+- EEPROM methods confirm EEbusy=0 before restoring automatic refresh, including
+  on error paths. New `EepromError::RestoreBusy` preserves an original failure
+  when restoration is skipped because a cycle is still running. Exhaustive
+  matches on `EepromError` must handle the new variant.
+- Linux hardware examples encapsulate their imports and code in a single
+  target-OS-gated module, allowing full Cargo tests on other desktop platforms.
+  Running an example outside Linux reports the platform requirement and exits
+  with status 1.
+- Mux documentation requires serializing entire driver calls when several
+  tasks or threads can change the same mux channel, including EEPROM delays.
 - Running countdown readout masks unimplemented upper bits while retaining
   the Timer Status 0/1 shadow-register burst.
 - Alarm reads and writes encode/decode the current 12-/24-hour mode, including
@@ -78,7 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_hms()` uses the existing hour mode and normalizes 12-hour AM/PM values
   to hours 0–23, sharing the complete calendar reader's hour validation.
 - All datetime setters write seconds through year in one coherent calendar
-  transfer after writing the independent Unix counter. Both hour modes are
+  transfer before writing the independent Unix counter. Both hour modes are
   encoded using the existing Control 2 setting, without modifying alarm setup.
 - Status flag acknowledgements write zeros only to selected flags and ones to
   every unrelated writable flag, without read-modify-write. This prevents loss

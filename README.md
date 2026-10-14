@@ -82,12 +82,18 @@ let mut rtc1 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b0000_0
 let mut rtc2 = RV3028::new_with_mux(RefCellDevice::new(&i2c_bus), 0x70, 0b1000_0000);
 ```
 
+Call these drivers sequentially. If tasks or threads can change the same mux's
+channel, serialize entire driver methods, including EEPROM delays. A shared-bus
+adapter's per-transaction lock does not protect mux selection and subsequent
+RTC accesses together.
+
 ### Calendar access
 
 `set_datetime_parts(&parts)` and both backend `set_datetime` methods write
-the Unix counter first, then all seven calendar registers (0x00–0x06) in one
-coherent burst. They use the existing 12-/24-hour mode without changing Control 2
-or alarm configuration. Input hours are always 0–23.
+all seven calendar registers (0x00–0x06) in one coherent burst, resetting the
+prescaler through Seconds, then the Unix counter. They use the existing
+12-/24-hour mode without changing Control 2 or alarm configuration.
+Input hours are always 0–23.
 
 `set_seconds`, `set_minutes`, `set_hours`, `set_weekday`, `set_day`,
 `set_month` and `set_year` write individual calendar registers. Arguments are
@@ -111,8 +117,10 @@ the calendar. Reading the date and time separately with `get_ymd()` and
 `get_hms()` does not form one coherent full-calendar snapshot.
 
 The [Application Manual](https://www.microcrystal.com/fileadmin/Media/Products/RTC/App.Manual/RV-3028-C7_App-Manual.pdf),
-section 4.5, requires the calendar transfer to finish in less than 950 ms for
-register blocking. The HAL must provide suitable transaction timeouts.
+sections 4.5 and 4.16.1, requires the calendar transfer to finish in less than
+950 ms for register blocking, and the Unix write's STOP to occur less than
+950 ms after writing Seconds. The caller/HAL must enforce these deadlines,
+including scheduling delays between the two writes.
 Control 2 and the calendar are separate accesses; exclude concurrent hour-mode
 changes. Unix counter and calendar writes are also separate: a failed operation
 can leave them inconsistent. No rollback, retry, readback or flag clearing occurs.
@@ -124,6 +132,11 @@ Control 2's 12_24 field. Calendar, timestamp and alarm APIs use civil hours 0–
 in either mode; the driver encodes and decodes AM/PM. Alarm setters/readers,
 including the chrono and jiff backends, use the current mode and preserve each
 alarm field's matching enable.
+
+Alarm setters pause AIE before changing WADA or alarm fields, acknowledge AF,
+then restore the original AIE state. Other Control 2 bits and CLKF are preserved.
+Exclude concurrent mode/alarm/control changes. Bus failures stop without rollback
+and can leave AIE disabled or the alarm partially configured.
 
 The chip automatically converts its running Hours register on a mode change,
 but requires Hours Alarm to be rewritten. The setter pauses AIE, changes the
@@ -389,12 +402,16 @@ For configuration mirrors, the driver provides:
 The chip's command protocol uses 1 ms settling for read/refresh and 10 ms for
 write/update before polling EEbusy. Each idle wait allows at most 200 one-millisecond
 intervals; HAL transaction timeouts remain the HAL's responsibility. The original
-EERD state is restored on success and attempted on failure. Other Control 1 bits
-are preserved. EEPROM methods return `EepromError<I2C::Error>`:
+EERD state is restored only after confirming EEbusy=0, including after a failure.
+Other Control 1 bits are preserved. EEPROM methods return `EepromError<I2C::Error>`:
 
 - `Operation(kind)`: driver/bus failure, busy timeout, or readback mismatch.
+- `RestoreBusy { operation }`: EEbusy is still set; restoring auto-refresh was
+  skipped, retaining any original failure. EERD normally remains 1, but is
+  unknown if the initial write to disable refresh failed. Confirm EEbusy=0
+  before explicitly restoring EERD through register access.
 - `Restore { operation, error }`: failure to restore EERD, retaining any original
-  operation failure too. EERD is then unknown.
+  operation failure too. This includes a failed idle check; EERD is then unknown.
 
 After a timeout or bus failure, a command may still be running and data may be
 partially written. There is no automatic retry or rollback. VDD must stay at least
