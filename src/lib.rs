@@ -32,21 +32,46 @@
 //! - **Explicit prescaler RESET command:** no dedicated method for Control 2 RESET
 //!   and its documented timing effects. Calendar setters already reset the
 //!   prescaler by writing Seconds; timestamp-log reset is implemented separately.
-//! - **Combined interrupt/CLKOUT routing configuration:** no typed configuration
-//!   spanning Control 2 interrupt enables and Clock Interrupt Mask. Individual
-//!   interrupt toggles, CLKIE toggle and mask clearing exist, and technical readout
-//!   exposes the raw control/mask bytes.
-//!
-//! Additional API gaps concern functions that are already implemented: EVI filtering
-//! uses a validated raw two-bit ET argument rather than a typed enum, and countdown
-//! configuration accepts a duration rather than an explicit clock/tick preset.
-//! There are no dedicated configuration getters for those two functions.
-//!
+//! `EviConfig` with typed polarity/filter, `CountdownTimerConfig` with explicit
+//! clock/tick presets, and `InterruptConfig` with all six INT enables and all four
+//! CLKOUT masks are implemented, including configuration getters. Duration-based
+//! timer and raw-filter EVI compatibility methods use the same implementations.
 //! Hour-mode switching, 12-hour alarm encoding, timestamp logging, Backup/CLKOUT
-//! configuration, calendar access and User RAM/EEPROM access are implemented.
+//! configuration, calendar access and User RAM/EEPROM access are also implemented.
 //! Reference: Application Manual rev. 1.4, especially sections 4.15, 4.17 and 4.18.
 //! Drift measurement, calibration policy and board-specific defaults belong to the
 //! owner, rather than being missing hardware-driver features.
+//!
+//! # Typed hardware configuration
+//!
+//! `EviConfig` represents EHL/ET and EIE/CEIE. [RV3028::get_evi_config]
+//! is read-only; [RV3028::set_evi_config] acknowledges only EVF.
+//! `CountdownTimerConfig` represents TD/TRPT/TE and a 12-bit preset,
+//! independently of the running count and timer interrupt enable.
+//! `InterruptConfig` covers all INT enables and interrupt-controlled CLKOUT
+//! masks; applying it never acknowledges flags or programs EEPROM.
+//! See each setter for concurrency, partial-failure and active-mirror semantics.
+//!
+//! ```
+//! use embedded_hal::i2c::I2c;
+//! use rv3028c7_rtc::{CountdownTimerConfig, EviConfig, EviFilter, EviPolarity,
+//!     Error, RV3028, TimerClockFreq};
+//!
+//! fn configure<I: I2c>(rtc: &mut RV3028<I>) -> Result<(), Error<I::Error>> {
+//!     rtc.set_evi_config(&EviConfig {
+//!         polarity: EviPolarity::RisingOrHigh,
+//!         filter: EviFilter::Millis15Point6,
+//!         interrupt_enabled: false, clockout_enabled: false,
+//!     })?;
+//!     rtc.set_countdown_timer_config(&CountdownTimerConfig {
+//!         clock: TimerClockFreq::Hertz64, ticks: 64,
+//!         repeat: false, enabled: false,
+//!     })?;
+//!     let mut routing = rtc.get_interrupt_config()?;
+//!     routing.interrupts.countdown_timer = true;
+//!     rtc.set_interrupt_config(&routing)
+//! }
+//! ```
 //!
 //! # Example
 //!
@@ -94,6 +119,15 @@ mod jiff_impl;
 pub use jiff;
 #[cfg(feature = "jiff")]
 pub use jiff_impl::JiffDateTimeAccess;
+
+mod evi;
+pub use evi::{EviConfig, EviFilter, EviPolarity};
+mod timer;
+pub use timer::{COUNTDOWN_MAX_TICKS, CountdownTimerConfig, TimerClockFreq};
+mod interrupt;
+pub use interrupt::{ClkoutInterruptConfig, InterruptConfig, InterruptEnables};
+#[cfg(test)]
+mod typed_api_tests;
 
 mod hour_mode;
 pub use hour_mode::HourMode;
@@ -278,15 +312,6 @@ enum RegControl1Bits {
   TimerEnableBit = 1 << 2,
   // TD / Timer Clock Frequency selection bits
   TimerClockFreqBits = 0b11,
-}
-
-/// Countown timer clock frequency selector
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum TimerClockFreq {
-  Hertz4096 = 0b00, // 4096 Hz, 244.14 μs period
-  Hertz64 = 0b01, // 64 Hz, 15.625 ms period
-  Hertz1 = 0b10, // 1 Hz, One second period
-  HertzSixtieth = 0b11, // 1/60 Hz, One minute period
 }
 
 // Status bits 6–0 are write-zero-to-clear; EEbusy (bit 7) is read-only.
@@ -1486,29 +1511,6 @@ impl<I2C> RV3028<I2C>
     Ok(())
   }
 
-  const MAX_PCT_TICKS: u16 = 0x0FFF; // 4095
-  // Select the finest source whose full 12-bit range includes the request.
-  // Use rational frequency arithmetic; Duration truncates fractional nanoseconds.
-  fn pct_ticks_and_rate_for_duration(duration: &Duration) -> (u16, TimerClockFreq, Duration) {
-    let nanos = duration.as_nanos();
-    for (freq, numerator, denominator) in [
-      (TimerClockFreq::Hertz4096, 4096u128, 1u128),
-      (TimerClockFreq::Hertz64, 64, 1),
-      (TimerClockFreq::Hertz1, 1, 1),
-      (TimerClockFreq::HertzSixtieth, 1, 60),
-    ] {
-      let scaled = nanos * numerator;
-      let unit = 1_000_000_000 * denominator;
-      if scaled <= u128::from(Self::MAX_PCT_TICKS) * unit {
-        let ticks = if nanos == 0 { 0 } else { (scaled / unit).max(1) };
-        let period_ns = ticks * unit / numerator;
-        return (ticks as u16, freq, Duration::from_nanos(period_ns as u64));
-      }
-    }
-    (Self::MAX_PCT_TICKS, TimerClockFreq::HertzSixtieth,
-      Duration::from_secs(u64::from(Self::MAX_PCT_TICKS) * 60))
-  }
-
   /// Prepare the Periodic Countdown Timer for a countdown,
   /// and optionally start the countdown.
   ///
@@ -1530,16 +1532,9 @@ impl<I2C> RV3028<I2C>
   pub fn config_countdown_timer(&mut self, duration: &Duration,
                                 repeat: bool, start: bool
   ) -> Result<Duration, Error<I2C::Error>> {
-    let (ticks, freq, estimated) =
-      Self::pct_ticks_and_rate_for_duration(duration);
-
-    self.select_mux_channel()?;
-    self.config_pct_raw(ticks, freq, repeat)?;
-    if start {
-      self.set_reg_bits_raw(REG_CONTROL1, RegControl1Bits::TimerEnableBit as u8)?;
-    }
-
-    Ok(estimated)
+    let config = CountdownTimerConfig::from_duration(duration, repeat, start);
+    self.set_countdown_timer_config(&config)?;
+    Ok(config.nominal_period().unwrap())
   }
 
   /// Set whether the Periodic Countdown Timer mode is repeating (periodic) or one-shot.
@@ -1578,7 +1573,7 @@ impl<I2C> RV3028<I2C>
   pub fn get_countdown_value(&mut self) -> Result<u16, Error<I2C::Error>> {
     let mut read_buf = [0u8;2];
     self.read_multi_registers(REG_TIMER_STATUS0, &mut read_buf)?;
-    let value = ((read_buf[1] as u16) << 8) | (read_buf[0] as u16);
+    let value = (((read_buf[1] & 0x0F) as u16) << 8) | (read_buf[0] as u16);
     Ok(value)
   }
 
@@ -1596,7 +1591,8 @@ impl<I2C> RV3028<I2C>
   }
 
 
-  /// Configure event detection on the EVI pin
+  /// Configure event detection on the EVI pin.
+  /// Compatibility wrapper for [Self::set_evi_config]; validates the raw ET field.
   /// - `rising` whether edge detection is on rising edge / high level
   /// - `int_enable` whether events detected on EVI pin should generate an interrupt on INT pin
   /// - `filtering`: unshifted ET field, 0b00 (edge detection), 0b01 (3.9 ms),
@@ -1611,8 +1607,19 @@ impl<I2C> RV3028<I2C>
   pub fn config_ext_event_detection(
     &mut self, rising: bool, int_enable: bool, filtering: u8, clockout_enable: bool) -> Result<(), Error<I2C::Error>>
   {
-    if filtering > 0b11 { return Err(Error::InvalidData); }
-    self.select_mux_channel()?;
+    let filter = EviFilter::from_bits(filtering).ok_or(Error::InvalidData)?;
+    self.set_evi_config(&EviConfig {
+      polarity: if rising { EviPolarity::RisingOrHigh } else { EviPolarity::FallingOrLow },
+      filter, interrupt_enabled: int_enable, clockout_enabled: clockout_enable,
+    })
+  }
+
+  // Shared by typed configuration and the compatibility API, with one mux selection.
+  fn config_evi_raw(&mut self, config: &EviConfig) -> Result<(), Error<I2C::Error>> {
+    let rising = config.polarity == EviPolarity::RisingOrHigh;
+    let filtering = config.filter as u8;
+    let int_enable = config.interrupt_enabled;
+    let clockout_enable = config.clockout_enabled;
 
     // Timestamp capture is managed separately; this method only pauses EIE.
     // Clear EVF and update the EVI detection and routing fields.

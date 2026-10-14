@@ -144,7 +144,57 @@ capture changes for the entire operation. Bus failures stop immediately without
 rollback and can leave AIE disabled, the new mode applied or the alarm awaiting
 conversion; the owner must inspect and recover.
 
+### Interrupt and CLKOUT routing
+
+`get_interrupt_config()` and `set_interrupt_config(&config)` use
+`InterruptConfig`, containing `InterruptEnables` and `ClkoutInterruptConfig`.
+They cover UIE, TIE, AIE, EIE, PORIE, BSIE, CLKIE and all four Clock Interrupt
+Mask bits CUIE, CTIE, CAIE, CEIE. The getter is read-only and never acknowledges
+flags. Source-mask selection does not enable the corresponding internal interrupt;
+configure its interrupt enable as required by the hardware interrupt scheme.
+
+The setter pauses Control 2 output enables, merges PORIE/BSIE into their active
+RAM mirrors, writes the source mask and applies the requested Control 2 enables.
+It preserves TSE, hour mode, CLKOUT source/CLKOE/CLKSY, Backup/charger settings and
+oscillator calibration; RESET is never issued. All flags are retained, so existing
+flags may assert an output when enabled. It does not perform a glitch-free clock
+transition, and retained CLKF can keep CLKOUT active.
+
+PORIE/BSIE persistence requires the existing EEPROM API; automatic refresh may
+replace their active values. Exclude concurrent shared-register changes and
+EEPROM refresh throughout the operation. Failures stop without retry or rollback,
+and may leave output enables paused or configuration partially applied.
+
 ### EVI filtering and countdown timer
+
+`EviConfig` describes `EviPolarity::{FallingOrLow, RisingOrHigh}`,
+`EviFilter::{EdgeDetection, Millis3Point9, Millis15Point6, Millis125}`, and the
+shared EIE/CEIE output enables. `get_evi_config()` reads the settings in one
+0x10–0x13 burst without writes or acknowledgements. `set_evi_config(&config)`
+pauses EIE, acknowledges only EVF, applies detection/routing and restores the
+requested EIE. Timestamp source, overwrite, capture enable and retained log
+are preserved. EIE/CEIE use the source selected by TSS, including Backup
+Switchover; they do not select TSS or enable CLKIE. The owner must pause
+timestamp capture if changing detection while TSE is set is inappropriate.
+Bus failures can leave partial settings and EIE paused; exclude concurrent
+configuration changes. The raw-filter compatibility method delegates to this API.
+
+`CountdownTimerConfig` contains `clock: TimerClockFreq`, `ticks: u16`,
+`repeat` and `enabled`. `set_countdown_timer_config(&config)` accepts explicit
+0–4095 tick presets; larger values are rejected before mux/I/O. It stops the
+timer, writes clock/repeat/preset, acknowledges only TF, then optionally starts
+a fresh countdown. It preserves other Control 1 fields, interrupt enables and
+CLKOUT routing. Reapplying an enabled configuration restarts from its preset.
+Failures can leave the timer stopped or partially configured.
+
+`get_countdown_timer_config()` reads the preset and TE/TRPT/TD without writes
+or flag acknowledgement. The separate `get_countdown_value()` reads the running
+12-bit counter using the hardware shadow-register burst. TE can clear after a
+one-shot expires, so readout is not an atomic snapshot of a running timer.
+`CountdownTimerConfig::from_duration(&duration, repeat, enabled)` quantizes
+without I/O; `nominal_period()` returns the preset period, or `None` for an
+invalid preset. Duration-based configuration delegates to the typed setter.
+
 
 `config_ext_event_detection(rising, int_enable, filtering, clockout_enable)`
 takes an unshifted two-bit ET value: `0b00` for edge detection, or `0b01`,
@@ -404,18 +454,12 @@ read-modify-write rules or complete operating sequences:
 - **Explicit prescaler RESET command:** no dedicated method for Control 2 RESET
   and its documented timing effects. Calendar setters already reset the
   prescaler by writing Seconds; timestamp-log reset is implemented separately.
-- **Combined interrupt/CLKOUT routing configuration:** no typed configuration
-  spanning Control 2 interrupt enables and Clock Interrupt Mask. Individual
-  interrupt toggles, CLKIE toggle and mask clearing exist, and technical readout
-  exposes the raw control/mask bytes.
-
-Additional API gaps concern functions that are already implemented: EVI filtering
-uses a validated raw two-bit ET argument rather than a typed enum, and countdown
-configuration accepts a duration rather than an explicit clock/tick preset.
-There are no dedicated configuration getters for those two functions.
-
+`EviConfig` with typed polarity/filter, `CountdownTimerConfig` with explicit
+clock/tick presets, and `InterruptConfig` with all six INT enables and all four
+CLKOUT masks are implemented, including configuration getters. Duration-based
+timer and raw-filter EVI compatibility methods use the same implementations.
 Hour-mode switching, 12-hour alarm encoding, timestamp logging, Backup/CLKOUT
-configuration, calendar access and User RAM/EEPROM access are implemented.
+configuration, calendar access and User RAM/EEPROM access are also implemented.
 Reference: Application Manual rev. 1.4, especially sections 4.15, 4.17 and 4.18.
 Drift measurement, calibration policy and board-specific defaults belong to the
 owner, rather than being missing hardware-driver features.

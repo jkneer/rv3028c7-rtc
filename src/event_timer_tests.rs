@@ -15,7 +15,12 @@ fn every_invalid_evi_filter_is_rejected_before_mux_or_register_access() {
   rtc.i2c.done();
 }
 
-fn evi_transactions(filter: u8, rising: bool, interrupt: bool, clockout: bool) -> Vec<T> {
+pub(super) fn evi_transactions(
+  filter: u8,
+  rising: bool,
+  interrupt: bool,
+  clockout: bool,
+) -> Vec<T> {
   // Preserve TSE, hour mode, other interrupts, TSOW/TSS and other CLKOUT sources.
   let edge = if rising { 0xC3 } else { 0x83 };
   let event = edge | (filter << 4);
@@ -213,14 +218,22 @@ fn timer_cases() -> Vec<TimerCase> {
 fn timer_quantization_uses_exact_frequencies_and_defined_range_limits() {
   for (requested, clock, ticks, nominal) in timer_cases() {
     assert_eq!(
-      RV3028::<Mock>::pct_ticks_and_rate_for_duration(&requested),
+      {
+        let config = CountdownTimerConfig::from_duration(&requested, false, false);
+        (config.ticks, config.clock, config.nominal_period().unwrap())
+      },
       (ticks, clock, nominal),
       "{requested:?}"
     );
   }
 }
 
-fn timer_transactions(clock: TimerClockFreq, ticks: u16, repeat: bool, start: bool) -> Vec<T> {
+pub(super) fn timer_transactions(
+  clock: TimerClockFreq,
+  ticks: u16,
+  repeat: bool,
+  start: bool,
+) -> Vec<T> {
   let repeating = if repeat { 0xFB } else { 0x7B };
   let configured = (repeating & !0b11) | clock as u8;
   let mut transactions = vec![

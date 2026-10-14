@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.1] - Unreleased
 
 ### Added
+- Typed EVI polarity/filter/configuration with read-only getter and settings
+  setter; raw-filter compatibility access shares the same implementation.
+- Public timer clock selection and explicit countdown preset configuration,
+  read-only configuration getter, pure duration quantization/nominal-period
+  conversion, and pre-I/O 12-bit preset validation.
+- Typed configuration for all six INT enables and all four interrupt-controlled
+  CLKOUT sources. Getter is read-only; setter preserves hour mode, timestamp
+  capture, shared configuration/calibration bits and status flags. PORIE/BSIE
+  EEPROM persistence remains explicit.
 - Typed `HourMode` with read-only getter and guarded setter. Mode changes convert
   Hours Alarm, preserve its matching enable and pause/restore AIE. Active capture
   or any retained timestamp bytes prevent a change without discarding events.
@@ -49,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BCD/date/time/weekday and normalizes the current 12-/24-hour encoding.
 
 ### Fixed
+- Running countdown readout masks unimplemented upper bits while retaining
+  the Timer Status 0/1 shadow-register burst.
 - Alarm reads and writes encode/decode the current 12-/24-hour mode, including
   midnight/noon and AM/PM, while public hours remain 0–23 in all backends.
 - EVI filtering rejects values outside the two-bit ET field before any I/O,
